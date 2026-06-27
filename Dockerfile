@@ -3,9 +3,11 @@
 # CNI plugin assets, mirroring the runtime layout of upstream/Dockerfile.
 
 FROM rust:1-bookworm AS builder
-# protoc is required by the kr-bgp / kr-cri build scripts (tonic-prost-build).
+# protoc (+ well-known .proto files from libprotobuf-dev, e.g.
+# google/protobuf/timestamp.proto) is required by the kr-bgp / kr-cri build
+# scripts (tonic-prost-build).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
