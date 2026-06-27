@@ -12,12 +12,14 @@
 mod cleanup;
 mod netpol_wire;
 mod orchestrate;
+mod proxy_wire;
 mod routing_wire;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kr_config::KubeRouterConfig;
 use kr_observability::http;
@@ -97,6 +99,17 @@ async fn main() -> anyhow::Result<()> {
         controllers.push(tokio::spawn(async move {
             if let Err(e) = run_firewall(cfg, health2, rx).await {
                 tracing::error!(error = %e, "firewall controller exited with error");
+            }
+        }));
+    }
+    if config.run_service_proxy {
+        let cfg = config.clone();
+        let health2 = health.clone();
+        let metrics2 = metrics.clone();
+        let rx = shutdown_rx.clone();
+        controllers.push(tokio::spawn(async move {
+            if let Err(e) = run_serviceproxy(cfg, health2, metrics2, rx).await {
+                tracing::error!(error = %e, "service-proxy controller exited with error");
             }
         }));
     }
@@ -333,6 +346,20 @@ async fn run_firewall(
         families.push((IpFamily::V6, SystemIptables::for_family(IpFamily::V6)));
     }
 
+    // Local node pod CIDRs (to scope default-deny TAIL rejects).
+    let node_store = kr_kube_client::spawn_reflector::<Node>(
+        kr_kube_client::build_client(Some(&config.kubeconfig), Some(&config.master)).await?,
+    );
+    let nr = node_store.clone();
+    kr_kube_client::wait_with_timeout(
+        async move {
+            let _ = nr.wait_until_ready().await;
+        },
+        config.cache_sync_timeout,
+    )
+    .await?;
+    let pod_cidrs = routing_wire::StoreNodeRouteProvider::new(node_store).local_pod_cidrs(&name);
+
     let source = netpol_wire::StorePolicySource::new(policies, pods, namespaces);
     let controller = kr_netpol::FirewallController::new(
         SystemIpset::new(),
@@ -340,6 +367,8 @@ async fn run_firewall(
         source,
         name,
         config.iptables_sync_period,
+        config.netpol_default_deny,
+        pod_cidrs,
     );
     let mut rx = shutdown_rx;
     controller
@@ -354,6 +383,124 @@ async fn run_firewall(
             }
         })
         .await;
+    Ok(())
+}
+
+/// Build the client + Service/EndpointSlice informers and run the IPVS
+/// service-proxy controller until shutdown.
+async fn run_serviceproxy(
+    config: KubeRouterConfig,
+    health: Arc<Mutex<HealthState>>,
+    metrics: Arc<Metrics>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let client =
+        kr_kube_client::build_client(Some(&config.kubeconfig), Some(&config.master)).await?;
+    let services = kr_kube_client::spawn_reflector::<Service>(client.clone());
+    let slices = kr_kube_client::spawn_reflector::<EndpointSlice>(client.clone());
+    let nodes = kr_kube_client::spawn_reflector::<Node>(client);
+
+    let (sv, sl, nd) = (services.clone(), slices.clone(), nodes.clone());
+    kr_kube_client::wait_with_timeout(
+        async move {
+            let _ = sv.wait_until_ready().await;
+            let _ = sl.wait_until_ready().await;
+            let _ = nd.wait_until_ready().await;
+        },
+        config.cache_sync_timeout,
+    )
+    .await?;
+
+    let name = routing_wire::resolve_node_name(&config.hostname_override).ok_or_else(|| {
+        anyhow::anyhow!("cannot determine node name; set --hostname-override or NODE_NAME")
+    })?;
+
+    // IPVS connection tracking (needed for masquerade-mode ClusterIP).
+    let _ = kr_common::sysctl::write("net.ipv4.vs.conntrack", "1");
+
+    // Local pod CIDRs (for masquerade) + the node's primary IP.
+    let pod_cidrs = routing_wire::StoreNodeRouteProvider::new(nodes.clone()).local_pod_cidrs(&name);
+    let primary_ip = routing_wire::StoreNodeProvider::new(nodes, config.cluster_asn)
+        .local_node(&name)
+        .map(|n| n.ip);
+
+    // NodePort bind addresses: all local IPs under `--nodeport-bindon-all-ip`,
+    // else just the primary node IP.
+    let node_ips: Vec<std::net::IpAddr> = if config.nodeport_bindon_all_ip {
+        kr_proxy::local_ips::all_local_ips().await
+    } else {
+        primary_ip.into_iter().collect()
+    };
+
+    let provider = proxy_wire::StoreServiceProvider::new(services, slices, name);
+    let parse_nets =
+        |v: &[String]| -> Vec<ipnet::IpNet> { v.iter().filter_map(|s| s.parse().ok()).collect() };
+    let ranges = kr_proxy::sync::ValidationRanges {
+        external: parse_nets(&config.service_external_ip_range),
+        loadbalancer: parse_nets(&config.loadbalancer_ip_range),
+        cluster: parse_nets(&config.service_cluster_ip_range),
+        strict: config.strict_external_ip_validation,
+    };
+    let sync = kr_proxy::ServiceSync::new(
+        kr_proxy::SystemIpvs::new(),
+        kr_netlink_sys::SystemNetlink::new(),
+        provider,
+        config.ipvs_sync_period,
+        ranges,
+    )
+    .with_node_ips(node_ips)
+    .with_graceful(
+        config.ipvs_graceful_termination,
+        config.ipvs_graceful_period,
+    )
+    .with_metrics(kr_observability::ServiceMetrics::register(
+        metrics.registry(),
+    ))
+    .with_nodeport_healthchecks(kr_proxy::nodeport_hc::NodePortHealthChecks::new())
+    .with_node_port_range(kr_proxy::sync::parse_port_range(
+        &config.service_node_port_range,
+    ));
+
+    // Hairpin SNAT nat handlers per enabled IP family.
+    let mut hairpin_nat: Vec<(bool, std::sync::Arc<dyn kr_proxy::hairpin::NatOps>)> = Vec::new();
+    if config.enable_ipv4 {
+        hairpin_nat.push((
+            false,
+            std::sync::Arc::new(kr_proxy::hairpin::SystemNat::for_family(
+                kr_common::ipfamily::IpFamily::V4,
+            )),
+        ));
+    }
+    if config.enable_ipv6 {
+        hairpin_nat.push((
+            true,
+            std::sync::Arc::new(kr_proxy::hairpin::SystemNat::for_family(
+                kr_common::ipfamily::IpFamily::V6,
+            )),
+        ));
+    }
+    let masq = kr_proxy::sync::MasqueradeCfg {
+        all: config.masquerade_all,
+        random_fully: true,
+        primary: primary_ip
+            .map(|ip| vec![(ip.is_ipv6(), ip)])
+            .unwrap_or_default(),
+        pod_cidrs: pod_cidrs.iter().map(|c| c.to_string()).collect(),
+    };
+    let mut sync = sync
+        .with_hairpin(config.hairpin_mode, hairpin_nat)
+        .with_masquerade(masq);
+    sync.run(health, async move {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            if shutdown_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
     Ok(())
 }
 

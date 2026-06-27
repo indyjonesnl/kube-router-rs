@@ -28,6 +28,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         404 => "Not Found",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Unknown",
     }
 }

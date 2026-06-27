@@ -76,11 +76,12 @@ spec:
           args:
             - --run-router=true
             - --run-firewall=true
-            - --run-service-proxy=false
+            - --run-service-proxy=true
             - --run-loadbalancer=false
             - --cluster-asn=64512
-            # short sync period for the e2e loop (event-driven sync is a follow-up)
+            # short sync periods for the e2e loop (event-driven sync is a follow-up)
             - --iptables-sync-period=10s
+            - --ipvs-sync-period=10s
             - --metrics-port=8080
             - --health-port=20244
             - -v=1

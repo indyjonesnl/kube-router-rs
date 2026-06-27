@@ -34,6 +34,7 @@ kr-kube-client = { path = "crates/kube-client" }
 kr-routing = { path = "crates/routing" }
 kr-cni = { path = "crates/cni" }
 kr-netpol = { path = "crates/netpol" }
+kr-proxy = { path = "crates/proxy" }
 
 # Shared external dependencies
 anyhow = "1"

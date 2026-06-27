@@ -8,7 +8,8 @@ OUT="${1:-$HOME/.kube/k0s-docker.yaml}"
 mkdir -p "$(dirname "$OUT")"
 
 docker exec k0s-controller-1 k0s kubeconfig admin >"$OUT"
-sed -i -E 's#server: https://[^[:space:]]+:6443#server: https://127.0.0.1:6443#' "$OUT"
+# API is published to host :7443 (see compose-cluster.yaml).
+sed -i -E 's#server: https://[^[:space:]]+:6443#server: https://127.0.0.1:7443#' "$OUT"
 
 echo "wrote $OUT"
 KUBECONFIG="$OUT" kubectl get nodes

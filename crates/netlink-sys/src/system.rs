@@ -108,7 +108,13 @@ impl NetlinkOps for SystemNetlink {
             .await;
         match r {
             Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("File exists") => Ok(()),
+            // Already present: `File exists` or `Address already assigned` — idempotent.
+            Err(e)
+                if e.to_string().contains("File exists")
+                    || e.to_string().contains("already assigned") =>
+            {
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }

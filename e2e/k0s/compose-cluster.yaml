@@ -46,7 +46,7 @@ services:
     networks:
       - k0s-net
     ports:
-      - 6443:6443 # publish the Kubernetes API server port to the host
+      - 7443:6443 # publish the API to host :7443 (avoids a :6443 collision on this host)
     tmpfs:
       - /run
       - /tmp

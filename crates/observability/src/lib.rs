@@ -6,4 +6,4 @@ pub mod logging;
 pub mod metrics;
 
 pub use health::{Component, HealthState};
-pub use metrics::Metrics;
+pub use metrics::{Metrics, ServiceMetrics, ServiceStatSample};

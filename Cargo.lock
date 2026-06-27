@@ -1073,6 +1073,19 @@ dependencies = [
 [[package]]
 name = "kr-cri"
 version = "0.1.0"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "kr-kube-client"
@@ -1132,6 +1145,16 @@ dependencies = [
 [[package]]
 name = "kr-proxy"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ipnet",
+ "kr-common",
+ "kr-netlink-sys",
+ "kr-observability",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "kr-routing"
@@ -1229,6 +1252,7 @@ dependencies = [
  "kr-netlink-sys",
  "kr-netpol",
  "kr-observability",
+ "kr-proxy",
  "kr-routing",
  "kube",
  "libc",

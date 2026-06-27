@@ -56,6 +56,8 @@ pub struct FirewallController<I: IpsetOps, T: IptablesOps, S: PolicySource> {
     /// Stable sync version → stable chain names (re-flushed each sync).
     sync_version: String,
     sync_period: Duration,
+    default_deny: bool,
+    pod_cidrs: Vec<ipnet::IpNet>,
 }
 
 impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
@@ -66,6 +68,8 @@ impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
         source: S,
         node: String,
         sync_period: Duration,
+        default_deny: bool,
+        pod_cidrs: Vec<ipnet::IpNet>,
     ) -> Self {
         Self {
             ipset,
@@ -74,6 +78,8 @@ impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
             node,
             sync_version: "kr".to_string(),
             sync_period,
+            default_deny,
+            pod_cidrs,
         }
     }
 
@@ -88,6 +94,8 @@ impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
                 &self.node,
                 *family,
                 &self.sync_version,
+                self.default_deny,
+                &self.pod_cidrs,
             );
             for set in &plan.ipsets {
                 let payload =
@@ -194,6 +202,8 @@ mod tests {
             StaticSource(world),
             "node-a".to_string(),
             Duration::from_secs(300),
+            false,
+            Vec::new(),
         );
         ctrl.reconcile().await.unwrap();
 

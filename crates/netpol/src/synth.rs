@@ -13,12 +13,13 @@
 //! NOTE: egress, named ports, and upstream's exact mark/COMMON/TAIL layout are
 //! follow-ups; this is a correct, verifiable ingress firewall.
 
+use ipnet::IpNet;
 use kr_common::ipfamily::IpFamily;
 use kr_common::naming::{network_policy_chain, pod_firewall_chain};
 
 use crate::ipset::SetType;
 use crate::model::{selector_matches, Namespace, NetworkPolicy, Pod};
-use crate::naming::{indexed_src_set, ROUTER_FORWARD, ROUTER_INPUT, ROUTER_OUTPUT};
+use crate::naming::{indexed_src_set, local_pods_set, ROUTER_FORWARD, ROUTER_INPUT, ROUTER_OUTPUT};
 use crate::translate::resolve_peers;
 
 /// An ipset to (re)populate.
@@ -70,6 +71,12 @@ fn pod_family_ips(pod: &Pod, family: IpFamily) -> Vec<String> {
 }
 
 /// Build the firewall plan for `family`.
+///
+/// When `default_deny` is set, traffic to local pod IPs not in the
+/// `kube-router-local-pods` set (i.e. not yet programmed) is rejected — closing
+/// the race window for freshly-created pods. `pod_cidrs` scopes those rejects to
+/// the node's pod range(s).
+#[allow(clippy::too_many_arguments)]
 pub fn build_plan(
     policies: &[NetworkPolicy],
     pods: &[Pod],
@@ -77,6 +84,8 @@ pub fn build_plan(
     node: &str,
     family: IpFamily,
     sync_version: &str,
+    default_deny: bool,
+    pod_cidrs: &[IpNet],
 ) -> FirewallPlan {
     let mut plan = FirewallPlan {
         chain_decls: vec![
@@ -125,6 +134,7 @@ pub fn build_plan(
     }
 
     // Per-pod firewall chains for local, actionable, policy-selected pods.
+    let mut programmed_ips: Vec<String> = Vec::new();
     for pod in pods
         .iter()
         .filter(|p| p.node_name == node && !p.host_network && !pod_family_ips(p, family).is_empty())
@@ -154,6 +164,32 @@ pub fn build_plan(
                 .push(format!("-A {ROUTER_FORWARD} -d {ip} -j {podchain}"));
             plan.rules
                 .push(format!("-A {ROUTER_INPUT} -d {ip} -j {podchain}"));
+            programmed_ips.push(ip);
+        }
+    }
+
+    // Default-deny: reject traffic to pod-range dests not yet programmed.
+    if default_deny {
+        let set = local_pods_set(family);
+        plan.ipsets.push(IpsetPlan {
+            name: set.clone(),
+            set_type: SetType::HashIp,
+            family,
+            entries: programmed_ips,
+        });
+        let reject = reject_target(family);
+        for cidr in pod_cidrs.iter().filter(|c| {
+            matches!(
+                (c, family),
+                (IpNet::V4(_), IpFamily::V4) | (IpNet::V6(_), IpFamily::V6)
+            )
+        }) {
+            plan.rules.push(format!(
+                "-A {ROUTER_FORWARD} -d {cidr} -m set ! --match-set {set} dst -j {reject}"
+            ));
+            plan.rules.push(format!(
+                "-A {ROUTER_INPUT} -d {cidr} -m set ! --match-set {set} dst -j {reject}"
+            ));
         }
     }
 
@@ -212,6 +248,8 @@ mod tests {
             "node-a",
             IpFamily::V4,
             "1",
+            false,
+            &[],
         );
         // db isn't selected → no pod-fw chain, no dispatch.
         assert!(!plan.rules.iter().any(|r| r.contains("10.244.0.9")));
@@ -230,6 +268,8 @@ mod tests {
             "node-a",
             IpFamily::V4,
             "1",
+            false,
+            &[],
         );
 
         // dispatch to web's pod-fw chain by dest IP.
@@ -259,11 +299,36 @@ mod tests {
     }
 
     #[test]
+    fn default_deny_adds_local_pods_set_and_tail_reject() {
+        let pods = vec![pod("default", "x", &[("app", "x")], "10.244.0.9")];
+        let cidrs = vec!["10.244.0.0/24".parse().unwrap()];
+        let plan = build_plan(&[], &pods, &[], "node-a", IpFamily::V4, "1", true, &cidrs);
+        assert!(plan
+            .ipsets
+            .iter()
+            .any(|s| s.name == "kube-router-local-pods"));
+        assert!(plan.rules.iter().any(|r| r.contains("-d 10.244.0.0/24")
+            && r.contains("! --match-set kube-router-local-pods dst")
+            && r.contains("-j REJECT")));
+    }
+
+    #[test]
+    fn no_default_deny_means_no_tail_reject() {
+        let pods = vec![pod("default", "x", &[("app", "x")], "10.244.0.9")];
+        let cidrs = vec!["10.244.0.0/24".parse().unwrap()];
+        let plan = build_plan(&[], &pods, &[], "node-a", IpFamily::V4, "1", false, &cidrs);
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|r| r.contains("kube-router-local-pods")));
+    }
+
+    #[test]
     fn deny_all_ingress_when_no_rules() {
         let mut pol = allow_from("web", "client");
         pol.ingress.clear(); // ingress type, no rules → deny all
         let pods = vec![pod("default", "web", &[("app", "web")], "10.244.0.5")];
-        let plan = build_plan(&[pol], &pods, &[], "node-a", IpFamily::V4, "1");
+        let plan = build_plan(&[pol], &pods, &[], "node-a", IpFamily::V4, "1", false, &[]);
         // pod-fw chain exists with reject, but no ACCEPT-from rules.
         assert!(plan.rules.iter().any(|r| r.contains("-j REJECT")));
         assert!(!plan.rules.iter().any(|r| r.contains("-m set --match-set")));

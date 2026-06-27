@@ -19,6 +19,15 @@ pub const MARK_ACCEPTED: &str = "0x20000/0x20000";
 /// ipset holding local pod IPs, used to gate default-deny REJECTs.
 pub const LOCAL_PODS_SET: &str = "kube-router-local-pods";
 
+/// Per-family local-pods set name (v6 gets a distinct set — ipset names are
+/// global and a set is single-family).
+pub fn local_pods_set(family: IpFamily) -> String {
+    match family {
+        IpFamily::V4 => LOCAL_PODS_SET.to_string(),
+        IpFamily::V6 => format!("{LOCAL_PODS_SET}-inet6"),
+    }
+}
+
 /// Per-policy source ipset name: `KUBE-SRC-<hash16(ns+name+family)>`.
 pub fn src_set(namespace: &str, policy: &str, family: IpFamily) -> String {
     format!(
