@@ -1,0 +1,15 @@
+[package]
+name = "kr-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kr-common = { workspace = true }
+clap = { workspace = true }
+ipnet = { workspace = true }
+humantime = { workspace = true }
+
+[dev-dependencies]
+clap = { workspace = true }

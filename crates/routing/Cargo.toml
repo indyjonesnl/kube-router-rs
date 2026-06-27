@@ -1,0 +1,22 @@
+[package]
+name = "kr-routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kr-common = { workspace = true }
+kr-bgp = { workspace = true }
+kr-netlink-sys = { workspace = true }
+kr-observability = { workspace = true }
+ipnet = { workspace = true }
+serde = { workspace = true }
+serde_yaml_ng = "0.10"
+tokio = { workspace = true, features = ["time", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+kr-netlink-sys = { workspace = true, features = ["mock"] }
+kr-bgp = { workspace = true, features = ["mock"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util", "sync"] }

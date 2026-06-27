@@ -1,4 +1,20 @@
 .specify/
 .claude/
-docs/
+specs/
 upstream/
+
+# e2e build artifacts (binaries staged into the image build context)
+/e2e/k0s/gobgp-bin/
+/e2e/k0s/kube-router-rs
+
+# Rust
+/target
+**/*.rs.bk
+*.rlib
+*.prof*
+*.log
+.env*
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp

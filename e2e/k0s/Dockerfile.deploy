@@ -1,0 +1,22 @@
+# Runtime image for the local e2e cluster: a host-built kube-router-rs binary on
+# ubuntu:24.04 (matches host glibc 2.39) + the data-plane CLIs the agent shells
+# out to + bundled CNI plugins (copied to the host /opt/cni/bin at startup).
+# Build context is this directory (e2e/k0s), which must contain the
+# `kube-router-rs` binary (see the deploy flow).
+FROM ubuntu:24.04
+
+ARG CNI_PLUGINS_VERSION=v1.5.1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        iptables ipset ipvsadm iproute2 conntrack ca-certificates curl \
+    && mkdir -p /opt/cni-bundled \
+    && curl -sSLf "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-${CNI_PLUGINS_VERSION}.tgz" \
+        | tar -xz -C /opt/cni-bundled ./bridge ./host-local ./loopback \
+    && apt-get purge -y curl && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# GoBGP engine (built from upstream's pinned v4.5.0; statically linked).
+COPY gobgp-bin/gobgpd /usr/local/bin/gobgpd
+COPY gobgp-bin/gobgp /usr/local/bin/gobgp
+COPY kube-router-rs /usr/local/bin/kube-router-rs
+ENTRYPOINT ["/usr/local/bin/kube-router-rs"]

@@ -1,0 +1,52 @@
+name: Integration (k0s)
+
+# Provisions a k0s cluster, swaps the Go kube-router DaemonSet for kube-router-rs,
+# and runs the cluster-facing parity scenarios (FR-072). Scenarios are added per
+# user story (integration/tests/*). Until those land, this workflow only validates
+# that the image builds and a single-node k0s comes up with the agent scheduled.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  k0s-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build kube-router-rs image
+        run: docker build -t kube-router-rs:ci .
+
+      - name: Install k0s
+        run: |
+          curl -sSLf https://get.k0s.sh | sudo sh
+          sudo k0s install controller --single
+          sudo k0s start
+          # wait for the API to be ready
+          for i in $(seq 1 60); do
+            if sudo k0s kubectl get nodes >/dev/null 2>&1; then break; fi
+            sleep 5
+          done
+          sudo k0s kubectl get nodes
+
+      - name: Load image into k0s containerd
+        run: |
+          docker save kube-router-rs:ci | sudo k0s ctr images import -
+
+      - name: Deploy kube-router-rs (replacing kube-router)
+        run: |
+          sudo k0s kubectl apply -f daemonset/kube-router-rs.yaml
+          sudo k0s kubectl -n kube-system rollout status ds/kube-router-rs --timeout=300s
+
+      - name: Run integration scenarios
+        run: |
+          # Per-story scenarios live under integration/; invoked here as they are added.
+          if [ -d integration ]; then
+            echo "integration scenarios present; runner wired per story (T044, T058, ...)";
+          fi

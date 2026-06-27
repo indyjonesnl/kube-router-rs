@@ -1,0 +1,27 @@
+[package]
+name = "kr-bgp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+mock = []
+
+[dependencies]
+kr-common = { workspace = true }
+ipnet = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["process", "net", "time", "macros", "sync"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time", "process"] }

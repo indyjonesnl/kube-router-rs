@@ -1,0 +1,111 @@
+# kube-router-rs DaemonSet + RBAC.
+# Mirrors upstream/daemonset RBAC and pod security context (privileged, hostNetwork,
+# hostPID) so kube-router-rs is a drop-in replacement. See contracts/dataplane-and-k8s.md.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-router-rs
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-router-rs
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, pods, services, nodes, endpoints]
+    verbs: [list, get, watch]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies]
+    verbs: [list, get, watch]
+  - apiGroups: ["extensions"]
+    resources: [networkpolicies]
+    verbs: [list, get, watch]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, create, update]
+  - apiGroups: [""]
+    resources: [services/status]
+    verbs: [update]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-router-rs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-router-rs
+subjects:
+  - kind: ServiceAccount
+    name: kube-router-rs
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-router-rs
+  namespace: kube-system
+  labels:
+    k8s-app: kube-router-rs
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-router-rs
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-router-rs
+    spec:
+      serviceAccountName: kube-router-rs
+      priorityClassName: system-node-critical
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: kube-router-rs
+          image: kube-router-rs:ci
+          args:
+            - --run-router=true
+            - --run-firewall=true
+            - --run-service-proxy=true
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 20244
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: cni-conf-dir
+              mountPath: /etc/cni/net.d
+            - name: xtables-lock
+              mountPath: /run/xtables.lock
+      volumes:
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: cni-conf-dir
+          hostPath:
+            path: /etc/cni/net.d
+        - name: xtables-lock
+          hostPath:
+            path: /run/xtables.lock
+            type: FileOrCreate

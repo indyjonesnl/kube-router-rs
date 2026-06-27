@@ -1,0 +1,21 @@
+[package]
+name = "kr-netpol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+mock = []
+
+[dependencies]
+kr-common = { workspace = true }
+kr-observability = { workspace = true }
+ipnet = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["process", "time", "macros", "sync", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

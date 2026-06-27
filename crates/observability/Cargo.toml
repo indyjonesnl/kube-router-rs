@@ -1,0 +1,15 @@
+[package]
+name = "kr-observability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = "0.13"
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }

@@ -1,0 +1,133 @@
+# kube-router-rs deployed into the local e2e k0s cluster as the CNI replacement
+# for k0s's bundled (Go) kube-router. Uses the locally-imported image
+# (kube-router-rs:dev, imagePullPolicy: Never).
+#
+# Current state: only the routing controller is enabled and its data plane is not
+# yet implemented (LoggingEngine BGP, no netlink/CNI programming). The agent runs
+# (hostNetwork), connects to the API, reconciles iBGP peers, and serves health —
+# but does NOT yet network pods. Nodes stay NotReady until the data plane lands.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-router-rs
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-router-rs
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, pods, services, nodes, endpoints]
+    verbs: [list, get, watch]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies]
+    verbs: [list, get, watch]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, create, update]
+  - apiGroups: [""]
+    resources: [services/status]
+    verbs: [update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-router-rs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-router-rs
+subjects:
+  - kind: ServiceAccount
+    name: kube-router-rs
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-router-rs
+  namespace: kube-system
+  labels:
+    k8s-app: kube-router-rs
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-router-rs
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-router-rs
+    spec:
+      serviceAccountName: kube-router-rs
+      priorityClassName: system-node-critical
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: Default # cluster DNS isn't up yet; don't depend on it
+      tolerations:
+        - operator: Exists # run on NotReady / tainted nodes
+      containers:
+        - name: kube-router-rs
+          image: kube-router-rs:dev
+          imagePullPolicy: Never
+          args:
+            - --run-router=true
+            - --run-firewall=true
+            - --run-service-proxy=false
+            - --run-loadbalancer=false
+            - --cluster-asn=64512
+            # short sync period for the e2e loop (event-driven sync is a follow-up)
+            - --iptables-sync-period=10s
+            - --metrics-port=8080
+            - --health-port=20244
+            - -v=1
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 20244
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: xtables-lock
+              mountPath: /run/xtables.lock
+            - name: cni-bin # host /opt/cni/bin — agent installs bridge/host-local/loopback here
+              mountPath: /opt/cni/bin
+            - name: cni-conf # host /etc/cni/net.d — agent writes 10-kuberouter.conflist here
+              mountPath: /etc/cni/net.d
+      volumes:
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+        - name: xtables-lock
+          hostPath:
+            path: /run/xtables.lock
+            type: FileOrCreate
+        - name: cni-bin
+          hostPath:
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate

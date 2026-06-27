@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kube-router-rs",
+    "crates/config",
+    "crates/kube-client",
+    "crates/netlink-sys",
+    "crates/routing",
+    "crates/bgp",
+    "crates/proxy",
+    "crates/netpol",
+    "crates/lballoc",
+    "crates/cni",
+    "crates/observability",
+    "crates/cri",
+    "crates/common",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT"
+repository = "https://github.com/indyjonesnl/kube-router-rs"
+
+[workspace.dependencies]
+# Internal crates
+kr-common = { path = "crates/common" }
+kr-config = { path = "crates/config" }
+kr-observability = { path = "crates/observability" }
+kr-bgp = { path = "crates/bgp" }
+kr-netlink-sys = { path = "crates/netlink-sys" }
+kr-kube-client = { path = "crates/kube-client" }
+kr-routing = { path = "crates/routing" }
+kr-cni = { path = "crates/cni" }
+kr-netpol = { path = "crates/netpol" }
+
+# Shared external dependencies
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+ipnet = "2"
+humantime = "2"
