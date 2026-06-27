@@ -11,9 +11,9 @@
 //! the netns tunnel execution (entering the pod via its CRI PID) is the in-cluster
 //! runtime layer.
 
-use crate::hairpin::{NatError, NatOps};
 use crate::ipvs::{IpvsDestination, IpvsError, IpvsOps};
 use crate::model::{EndpointInfo, Protocol, Scheduler};
+use crate::tcpmss::{MangleError, MangleOps};
 
 /// Tunnel interface owning the VIP in the endpoint pod (IPv4).
 pub const KUBE_TUNNEL_IF_V4: &str = "kube-tunnel-if";
@@ -45,9 +45,9 @@ pub enum DsrError {
     /// IPVS failure.
     #[error(transparent)]
     Ipvs(#[from] IpvsError),
-    /// nat (mangle) failure.
+    /// mangle-table failure.
     #[error(transparent)]
-    Nat(#[from] NatError),
+    Mangle(#[from] MangleError),
 }
 
 fn proto_name(p: Protocol) -> &'static str {
@@ -245,7 +245,7 @@ pub async fn configure_dsr_host<I, M>(
 ) -> Result<Vec<u32>, DsrError>
 where
     I: IpvsOps + ?Sized,
-    M: NatOps + ?Sized,
+    M: MangleOps + ?Sized,
 {
     let mut marks = Vec::new();
     for vip in vips {
@@ -275,8 +275,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hairpin::mock::MockNat;
     use crate::ipvs::mock::MockIpvs;
+    use crate::tcpmss::mock::MockMangle;
 
     #[test]
     fn fwmark_is_deterministic_and_14_bit() {
@@ -370,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn configure_dsr_host_programs_fwmark_service_dests_and_marks() {
         let ipvs = MockIpvs::new();
-        let mangle = MockNat::new();
+        let mangle = MockMangle::new();
         let mut reg = FwMarkRegistry::new();
         let eps = vec![
             EndpointInfo {

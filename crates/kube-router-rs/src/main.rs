@@ -487,9 +487,52 @@ async fn run_serviceproxy(
             .unwrap_or_default(),
         pod_cidrs: pod_cidrs.iter().map(|c| c.to_string()).collect(),
     };
+    // IPVS service firewall (KUBE-ROUTER-SERVICES REJECT chain when not permit-all).
+    let mut firewall_ipt: Vec<(bool, std::sync::Arc<dyn kr_proxy::firewall::FwIptables>)> =
+        Vec::new();
+    if config.enable_ipv4 {
+        firewall_ipt.push((
+            false,
+            std::sync::Arc::new(kr_proxy::firewall::SystemFwIptables::for_family(
+                kr_common::ipfamily::IpFamily::V4,
+            )),
+        ));
+    }
+    if config.enable_ipv6 {
+        firewall_ipt.push((
+            true,
+            std::sync::Arc::new(kr_proxy::firewall::SystemFwIptables::for_family(
+                kr_common::ipfamily::IpFamily::V6,
+            )),
+        ));
+    }
+    // DSR mangle handlers (FWMARK MARK + TCPMSS) per enabled family.
+    let mut dsr_mangle: Vec<(bool, std::sync::Arc<dyn kr_proxy::tcpmss::MangleOps>)> = Vec::new();
+    if config.enable_ipv4 {
+        dsr_mangle.push((
+            false,
+            std::sync::Arc::new(kr_proxy::tcpmss::SystemMangle::for_family(
+                kr_common::ipfamily::IpFamily::V4,
+            )),
+        ));
+    }
+    if config.enable_ipv6 {
+        dsr_mangle.push((
+            true,
+            std::sync::Arc::new(kr_proxy::tcpmss::SystemMangle::for_family(
+                kr_common::ipfamily::IpFamily::V6,
+            )),
+        ));
+    }
     let mut sync = sync
         .with_hairpin(config.hairpin_mode, hairpin_nat)
-        .with_masquerade(masq);
+        .with_masquerade(masq)
+        .with_dsr(dsr_mangle, 1500)
+        .with_firewall(
+            config.ipvs_permit_all,
+            firewall_ipt,
+            std::sync::Arc::new(kr_proxy::firewall::SystemFwIpset),
+        );
     sync.run(health, async move {
         loop {
             if *shutdown_rx.borrow() {

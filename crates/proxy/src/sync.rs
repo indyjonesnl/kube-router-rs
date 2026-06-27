@@ -13,11 +13,14 @@ use ipnet::IpNet;
 use kr_netlink_sys::NetlinkOps;
 use kr_observability::{Component, HealthState, ServiceMetrics, ServiceStatSample};
 
+use crate::dsr::{self, FwMarkRegistry};
+use crate::firewall::{self, FwIpset, FwIptables};
 use crate::graceful::GracefulQueue;
 use crate::hairpin::{self, NatOps};
 use crate::ipvs::{IpvsDestination, IpvsOps, IpvsService};
-use crate::model::{EndpointInfo, Protocol, ServiceInfo};
+use crate::model::{EndpointInfo, Protocol, Scheduler, ServiceInfo};
 use crate::nodeport_hc::{active_local_counts, NodePortHealthChecks};
+use crate::tcpmss::{self, MangleOps};
 use crate::validation::validate_external_ip;
 
 /// Dummy interface VIPs are bound to.
@@ -76,6 +79,22 @@ pub enum SyncError {
     /// NodePort health-check server failure.
     #[error("nodeport healthcheck error: {0}")]
     NodePort(String),
+    /// IPVS service firewall failure.
+    #[error("firewall error: {0}")]
+    Firewall(String),
+    /// DSR programming failure.
+    #[error("dsr error: {0}")]
+    Dsr(String),
+}
+
+/// A queued DSR datapath programming job for one service's external/LB VIPs.
+struct DsrJob {
+    vips: Vec<IpAddr>,
+    protocol: Protocol,
+    port: u16,
+    endpoints: Vec<EndpointInfo>,
+    scheduler: Scheduler,
+    persistent: Option<u32>,
 }
 
 fn prefix_len(ip: IpAddr) -> u8 {
@@ -117,6 +136,16 @@ pub struct ServiceSync<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> {
     node_port_range: Option<(u16, u16)>,
     /// Masquerade config: `(masquerade_all, random_fully, primary IP per family, pod CIDRs)`.
     masquerade: Option<MasqueradeCfg>,
+    /// `--ipvs-permit-all`: when false, the service firewall REJECTs unexpected traffic.
+    firewall_permit_all: bool,
+    /// filter-table handlers per family, as `(ipv6, ops)`; empty disables the firewall.
+    firewall_ipt: Vec<(bool, Arc<dyn FwIptables>)>,
+    firewall_ipset: Option<Arc<dyn FwIpset>>,
+    firewall_setup_done: bool,
+    /// mangle handlers for DSR FWMARK/TCPMSS rules, as `(ipv6, ops)` per family.
+    dsr_mangle: Vec<(bool, Arc<dyn MangleOps>)>,
+    dsr_mtu: i32,
+    dsr_registry: FwMarkRegistry,
     applied: BTreeMap<String, (IpvsService, Vec<IpvsDestination>)>,
     /// Maps an IPVS service key to its owning `(namespace, name)` for metrics.
     meta: BTreeMap<String, (String, String)>,
@@ -148,6 +177,13 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
             nphc: None,
             node_port_range: None,
             masquerade: None,
+            firewall_permit_all: true,
+            firewall_ipt: Vec::new(),
+            firewall_ipset: None,
+            firewall_setup_done: false,
+            dsr_mangle: Vec::new(),
+            dsr_mtu: 1500,
+            dsr_registry: FwMarkRegistry::new(),
             applied: BTreeMap::new(),
             meta: BTreeMap::new(),
             bound_vips: BTreeSet::new(),
@@ -186,6 +222,30 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
         self
     }
 
+    /// Enable DSR host-side programming for `kube-router.io/service.dsr` services:
+    /// external/LB VIPs use a FWMARK IPVS service (no dummy binding) with a mangle
+    /// MARK + TCPMSS clamp. `mangle` provides a handler per family `(ipv6, ops)`.
+    pub fn with_dsr(mut self, mangle: Vec<(bool, Arc<dyn MangleOps>)>, mtu: i32) -> Self {
+        self.dsr_mangle = mangle;
+        self.dsr_mtu = mtu;
+        self
+    }
+
+    /// Enable the IPVS service firewall. With `permit_all=false` it installs the
+    /// `KUBE-ROUTER-SERVICES` REJECT chain; `ipt` provides a filter handler per
+    /// family `(ipv6, ops)` and `ipset` populates the membership sets.
+    pub fn with_firewall(
+        mut self,
+        permit_all: bool,
+        ipt: Vec<(bool, Arc<dyn FwIptables>)>,
+        ipset: Arc<dyn FwIpset>,
+    ) -> Self {
+        self.firewall_permit_all = permit_all;
+        self.firewall_ipt = ipt;
+        self.firewall_ipset = Some(ipset);
+        self
+    }
+
     /// Set the node IP(s) NodePort services bind on (primary IP, or all local
     /// addresses under `--nodeport-bindon-all-ip`). Empty → NodePort disabled.
     pub fn with_node_ips(mut self, node_ips: Vec<IpAddr>) -> Self {
@@ -209,7 +269,12 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
         let mut desired: BTreeMap<String, (IpvsService, Vec<IpvsDestination>)> = BTreeMap::new();
         let mut want_vips: BTreeSet<IpAddr> = BTreeSet::new();
         let mut meta: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut dsr_jobs: Vec<DsrJob> = Vec::new();
+        let dsr_enabled = !self.dsr_mangle.is_empty();
         for (svc, eps) in self.provider.services() {
+            // DSR external/LB VIPs (when enabled) take the FWMARK path below instead
+            // of a dummy-bound IPVS service.
+            let mut dsr_vips: Vec<IpAddr> = Vec::new();
             let dests = |local_only: bool| -> Vec<IpvsDestination> {
                 eps.iter()
                     .filter(|e| e.ready && (!local_only || e.is_local))
@@ -247,7 +312,11 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
                     &self.ranges.cluster,
                     self.ranges.strict,
                 ) {
-                    add_vip(*vip, svc.external_traffic_local);
+                    if dsr_enabled && svc.dsr {
+                        dsr_vips.push(*vip);
+                    } else {
+                        add_vip(*vip, svc.external_traffic_local);
+                    }
                 }
             }
             for vip in &svc.load_balancer_ips {
@@ -257,8 +326,24 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
                     &self.ranges.cluster,
                     self.ranges.strict,
                 ) {
-                    add_vip(*vip, svc.external_traffic_local);
+                    if dsr_enabled && svc.dsr {
+                        dsr_vips.push(*vip);
+                    } else {
+                        add_vip(*vip, svc.external_traffic_local);
+                    }
                 }
+            }
+
+            // Queue the DSR FWMARK datapath for this service's external/LB VIPs.
+            if !dsr_vips.is_empty() {
+                dsr_jobs.push(DsrJob {
+                    vips: dsr_vips,
+                    protocol: svc.protocol,
+                    port: svc.port,
+                    endpoints: eps.clone(),
+                    scheduler: svc.scheduler,
+                    persistent: svc.session_affinity.then_some(svc.affinity_timeout),
+                });
             }
 
             // NodePort: an IPVS service per node IP on the node port, listening on
@@ -352,9 +437,84 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
 
         self.process_graceful_queue().await?;
         self.update_metrics().await?;
+        self.process_dsr_jobs(dsr_jobs).await?;
         self.sync_hairpin().await?;
         self.sync_masquerade().await?;
         self.sync_nodeport_healthchecks().await?;
+        self.sync_firewall().await?;
+        Ok(())
+    }
+
+    /// Program the host-side DSR datapath for queued jobs: a FWMARK IPVS service
+    /// with tunnel destinations, mangle MARK marking, and a TCPMSS clamp, per
+    /// family. The in-pod tunnel setup (CRI PID → nsenter) is the runtime layer.
+    async fn process_dsr_jobs(&mut self, jobs: Vec<DsrJob>) -> Result<(), SyncError> {
+        if self.dsr_mangle.is_empty() || jobs.is_empty() {
+            return Ok(());
+        }
+        for job in jobs {
+            for (ipv6, mangle) in &self.dsr_mangle {
+                let vips: Vec<IpAddr> = job
+                    .vips
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_ipv6() == *ipv6)
+                    .collect();
+                if vips.is_empty() {
+                    continue;
+                }
+                dsr::configure_dsr_host(
+                    &self.ipvs,
+                    mangle.as_ref(),
+                    &mut self.dsr_registry,
+                    &vips,
+                    job.protocol,
+                    job.port,
+                    &job.endpoints,
+                    job.scheduler,
+                    job.persistent,
+                )
+                .await
+                .map_err(|e| SyncError::Dsr(e.to_string()))?;
+                // Clamp MSS on reply SYNs from the pods for each VIP.
+                for vip in &vips {
+                    tcpmss::ensure_tcpmss(mangle.as_ref(), *vip, job.port, self.dsr_mtu)
+                        .await
+                        .map_err(|e| SyncError::Dsr(e.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set up (once) and refresh the IPVS service firewall chain + ipsets from the
+    /// currently programmed services (no-op if no firewall handlers configured).
+    async fn sync_firewall(&mut self) -> Result<(), SyncError> {
+        if self.firewall_ipt.is_empty() {
+            return Ok(());
+        }
+        if !self.firewall_setup_done {
+            for (ipv6, ipt) in &self.firewall_ipt {
+                firewall::setup_firewall(ipt.as_ref(), *ipv6, self.firewall_permit_all)
+                    .await
+                    .map_err(|e| SyncError::Firewall(e.to_string()))?;
+            }
+            self.firewall_setup_done = true;
+        }
+        let Some(ipset) = &self.firewall_ipset else {
+            return Ok(());
+        };
+        let local = crate::local_ips::all_local_ips().await;
+        let vips: Vec<(IpAddr, Protocol, u16)> = self
+            .applied
+            .values()
+            .map(|(s, _)| (s.addr, s.protocol, s.port))
+            .collect();
+        for (ipv6, _) in &self.firewall_ipt {
+            firewall::sync_firewall_sets(ipset.as_ref(), &local, &vips, *ipv6)
+                .await
+                .map_err(|e| SyncError::Firewall(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -870,6 +1030,46 @@ mod tests {
         assert!(out.contains(
             "kube_router_service_total_connections{port=\"80\",protocol=\"tcp\",service_name=\"web\",service_vip=\"10.96.0.10\",svc_namespace=\"default\"} 7"
         ));
+    }
+
+    #[tokio::test]
+    async fn dsr_external_ip_uses_fwmark_path_not_dummy_binding() {
+        use crate::tcpmss::mock::MockMangle;
+        let mut svc1 = svc("10.96.0.10");
+        svc1.dsr = true;
+        svc1.external_ips = vec!["203.0.113.5".parse().unwrap()];
+        let prov = Static(StdMutex::new(vec![(svc1, vec![ep("10.244.0.5", true)])]));
+        let mangle = std::sync::Arc::new(MockMangle::new());
+        let mut s = ServiceSync::new(
+            MockIpvs::new(),
+            MockNetlink::new(),
+            prov,
+            Duration::from_secs(300),
+            ValidationRanges::default(), // lenient → external IP validates
+        )
+        .with_dsr(
+            vec![(
+                false,
+                mangle.clone() as std::sync::Arc<dyn crate::tcpmss::MangleOps>,
+            )],
+            1500,
+        );
+        s.reconcile().await.unwrap();
+
+        // ClusterIP keeps a normal dummy-bound service; the DSR external IP does not
+        // get a dummy binding and is served via a FWMARK service instead.
+        assert!(s.nl.has_addr(DUMMY_IF, "10.96.0.10".parse().unwrap(), 32));
+        assert!(!s.nl.has_addr(DUMMY_IF, "203.0.113.5".parse().unwrap(), 32));
+        assert_eq!(s.ipvs.fwmark_services().len(), 1);
+        assert_eq!(s.ipvs.fwmark_dests().len(), 1);
+        assert!(s.ipvs.fwmark_dests()[0].1.tunnel);
+        // mangle MARK in PREROUTING + OUTPUT, plus a TCPMSS clamp rule.
+        let appended = mangle.appended.lock().unwrap();
+        assert!(appended.iter().any(|(c, _)| c == "PREROUTING"));
+        assert!(appended.iter().any(|(c, _)| c == "OUTPUT"));
+        assert!(appended
+            .iter()
+            .any(|(_, a)| a.contains(&"TCPMSS".to_string())));
     }
 
     #[tokio::test]

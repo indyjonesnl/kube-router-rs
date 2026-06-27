@@ -68,7 +68,7 @@ pub trait MangleOps: Send + Sync {
 pub struct MangleError(pub String);
 
 /// Program the TCPMSS clamp rule for a TCP service VIP.
-pub async fn ensure_tcpmss<M: MangleOps>(
+pub async fn ensure_tcpmss<M: MangleOps + ?Sized>(
     ops: &M,
     ip: IpAddr,
     port: u16,
@@ -79,7 +79,7 @@ pub async fn ensure_tcpmss<M: MangleOps>(
 }
 
 /// Remove the TCPMSS clamp rule for a TCP service VIP.
-pub async fn remove_tcpmss<M: MangleOps>(
+pub async fn remove_tcpmss<M: MangleOps + ?Sized>(
     ops: &M,
     ip: IpAddr,
     port: u16,

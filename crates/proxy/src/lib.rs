@@ -7,6 +7,7 @@
 //! loop build on these in subsequent tasks.
 
 pub mod dsr;
+pub mod firewall;
 pub mod graceful;
 pub mod hairpin;
 pub mod ipvs;
