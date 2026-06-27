@@ -3,6 +3,10 @@
 # CNI plugin assets, mirroring the runtime layout of upstream/Dockerfile.
 
 FROM rust:1-bookworm AS builder
+# protoc is required by the kr-bgp / kr-cri build scripts (tonic-prost-build).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --workspace --locked
