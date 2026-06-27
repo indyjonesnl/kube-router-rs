@@ -493,17 +493,11 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
         if self.firewall_ipt.is_empty() {
             return Ok(());
         }
-        if !self.firewall_setup_done {
-            for (ipv6, ipt) in &self.firewall_ipt {
-                firewall::setup_firewall(ipt.as_ref(), *ipv6, self.firewall_permit_all)
-                    .await
-                    .map_err(|e| SyncError::Firewall(e.to_string()))?;
-            }
-            self.firewall_setup_done = true;
-        }
         let Some(ipset) = &self.firewall_ipset else {
             return Ok(());
         };
+        // Refresh the ipsets FIRST so the chain rules that reference them by name
+        // can be added (iptables rejects `--match-set` against a missing set).
         let local = crate::local_ips::all_local_ips().await;
         let vips: Vec<(IpAddr, Protocol, u16)> = self
             .applied
@@ -514,6 +508,14 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
             firewall::sync_firewall_sets(ipset.as_ref(), &local, &vips, *ipv6)
                 .await
                 .map_err(|e| SyncError::Firewall(e.to_string()))?;
+        }
+        if !self.firewall_setup_done {
+            for (ipv6, ipt) in &self.firewall_ipt {
+                firewall::setup_firewall(ipt.as_ref(), *ipv6, self.firewall_permit_all)
+                    .await
+                    .map_err(|e| SyncError::Firewall(e.to_string()))?;
+            }
+            self.firewall_setup_done = true;
         }
         Ok(())
     }
