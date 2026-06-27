@@ -37,6 +37,13 @@ jobs:
 
       - name: Load image into k0s containerd
         run: |
+          # The embedded worker's containerd socket appears once the worker
+          # component has started; wait for it before importing.
+          for i in $(seq 1 60); do
+            if sudo test -S /run/k0s/containerd.sock; then break; fi
+            sleep 5
+          done
+          sudo test -S /run/k0s/containerd.sock
           docker save kube-router-rs:ci | sudo k0s ctr images import -
 
       - name: Deploy kube-router-rs (replacing kube-router)
