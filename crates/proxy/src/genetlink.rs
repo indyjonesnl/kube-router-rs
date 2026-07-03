@@ -363,6 +363,106 @@ mod tests {
         assert!(a.windows(3).any(|w| w == b"rr\0"));
     }
 
+    // --- privileged, root-only tests against the real kernel IPVS ---
+    // Run: `cargo test -p kr-proxy --features privileged -- --test-threads=1`
+    // as root. Each runs in a freshly-unshared network namespace so it never
+    // touches the host's IPVS table.
+    #[cfg(feature = "privileged")]
+    mod privileged {
+        use super::*;
+
+        /// Run `f` on a dedicated thread that has unshared into a fresh network
+        /// namespace (thread-local netns → isolated, no host state touched).
+        fn in_fresh_netns<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    // Best-effort: ensure the IPVS module is loaded.
+                    let _ = std::process::Command::new("modprobe").arg("ip_vs").status();
+                    // SAFETY: unshare(CLONE_NEWNET) moves this thread into a new
+                    // netns; requires root.
+                    let rc = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+                    assert_eq!(
+                        rc,
+                        0,
+                        "unshare(CLONE_NEWNET) failed (needs root): {}",
+                        std::io::Error::last_os_error()
+                    );
+                    f()
+                })
+                .join()
+                .unwrap()
+            })
+        }
+
+        fn svc() -> IpvsService {
+            IpvsService {
+                addr: "10.96.0.10".parse().unwrap(),
+                protocol: Protocol::Tcp,
+                port: 80,
+                scheduler: Scheduler::Rr,
+                persistent: None,
+            }
+        }
+
+        #[test]
+        fn genetlink_service_and_dest_round_trip() {
+            in_fresh_netns(|| {
+                let mut g = match Genl::open() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("SKIP: IPVS genl family unavailable ({e})");
+                        return;
+                    }
+                };
+                let s = svc();
+                g.add_service(&s).expect("add_service accepted by kernel");
+                let d = IpvsDestination {
+                    addr: "10.244.0.5".parse().unwrap(),
+                    port: 8080,
+                    weight: 1,
+                    tunnel: false,
+                };
+                g.add_destination(&s, &d).expect("add_destination accepted");
+                // Re-adding the same service must fail EEXIST — proves it was stored.
+                assert_eq!(
+                    g.add_service(&s).unwrap_err().raw_os_error(),
+                    Some(17),
+                    "re-add should be EEXIST"
+                );
+                g.del_service(&s).expect("del_service");
+                // Deleting again must fail ENOENT — proves it was removed.
+                assert_eq!(
+                    g.del_service(&s).unwrap_err().raw_os_error(),
+                    Some(2),
+                    "second del should be ENOENT"
+                );
+            });
+        }
+
+        #[test]
+        fn genetlink_fwmark_service_round_trip() {
+            in_fresh_netns(|| {
+                let mut g = match Genl::open() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("SKIP: IPVS genl family unavailable ({e})");
+                        return;
+                    }
+                };
+                g.add_fwmark_service(1151, Scheduler::Rr, None)
+                    .expect("add_fwmark_service accepted");
+                let d = IpvsDestination {
+                    addr: "10.244.0.5".parse().unwrap(),
+                    port: 8080,
+                    weight: 1,
+                    tunnel: true,
+                };
+                g.add_fwmark_destination(1151, &d)
+                    .expect("add_fwmark_destination (tunnel) accepted");
+            });
+        }
+    }
+
     #[test]
     fn proto_and_fwd_method_numbers() {
         assert_eq!(proto_num(Protocol::Tcp), 6);

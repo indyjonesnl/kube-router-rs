@@ -53,6 +53,10 @@ Health (`/healthz`) and Prometheus metrics (`/metrics`, `kube_router_*`) surface
 ## Verification
 
 Unit tests cover the pure logic in every crate (`cargo test --workspace`).
+Root-only **privileged tests** (mirroring upstream's `-tags privileged`) unshare
+a fresh network namespace and drive the real kernel IPVS genl family — run with
+`cargo test -p kr-proxy --features privileged` as root (a dedicated CI job does
+this; tests skip gracefully if the IPVS module is unavailable).
 Cluster-facing scenarios live in `integration/` (run against the dockerized k0s
 cluster in `e2e/k0s/`): `pod_networking.sh`, `advertisement.sh`, `dropin.sh`,
 `dualstack.sh`. CI runs fmt + build + clippy + tests, and a k0s job that deploys

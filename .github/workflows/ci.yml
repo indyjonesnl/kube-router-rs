@@ -43,3 +43,23 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+  privileged:
+    name: privileged netlink/IPVS tests (root netns)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable
+
+      - name: Load IPVS kernel module
+        run: sudo modprobe ip_vs || true
+
+      - name: Run privileged tests as root
+        # Unshares a fresh netns per test and drives the kernel IPVS genl family;
+        # tests SKIP gracefully if the IPVS family is unavailable on the runner.
+        run: sudo -E "$(which cargo)" test -p kr-proxy --features privileged -- --test-threads=1 --nocapture
