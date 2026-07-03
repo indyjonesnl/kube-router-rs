@@ -15,6 +15,7 @@ mod netpol_wire;
 mod orchestrate;
 mod proxy_wire;
 mod routing_wire;
+mod svc_vip_wire;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -159,7 +160,7 @@ async fn run_routing(
 ) -> anyhow::Result<()> {
     let client =
         kr_kube_client::build_client(Some(&config.kubeconfig), Some(&config.master)).await?;
-    let store = kr_kube_client::spawn_reflector::<Node>(client);
+    let store = kr_kube_client::spawn_reflector::<Node>(client.clone());
 
     let store_for_ready = store.clone();
     kr_kube_client::wait_with_timeout(
@@ -225,6 +226,28 @@ async fn run_routing(
                 config.injected_routes_sync_period,
                 until_shutdown(shutdown_rx.clone()),
             ));
+            // Advertise service VIPs (ClusterIP/ExternalIP/LB) to peers when any
+            // --advertise-*-ip is enabled.
+            let advertise_any = config.advertise_cluster_ip
+                || config.advertise_external_ip
+                || config.advertise_loadbalancer_ip;
+            let vip = match (advertise_any, local_ip) {
+                (true, Some(nh)) => Some(tokio::spawn(advertise_service_vips_task(
+                    we.clone(),
+                    client,
+                    name.clone(),
+                    kr_routing::service_vips::AdvertiseDefaults {
+                        cluster: config.advertise_cluster_ip,
+                        external: config.advertise_external_ip,
+                        loadbalancer: config.advertise_loadbalancer_ip,
+                    },
+                    nh,
+                    config.routes_sync_period,
+                    config.cache_sync_timeout,
+                    shutdown_rx.clone(),
+                ))),
+                _ => None,
+            };
             let watch = tokio::spawn(watch_task(we, tx, shutdown_rx.clone()));
             if let Some(mut c) = bgp {
                 c.run(health, until_shutdown(shutdown_rx)).await;
@@ -233,6 +256,9 @@ async fn run_routing(
             }
             inject.abort();
             watch.abort();
+            if let Some(v) = vip {
+                v.abort();
+            }
         }
         // Logging engine: flat-L2 direct routes via podnet.
         None => {
@@ -254,6 +280,52 @@ async fn run_routing(
         let _ = s.terminate().await;
     }
     Ok(())
+}
+
+/// Periodically compute the node's advertised service-VIP set and reconcile it
+/// to the BGP engine (add new VIPs, withdraw removed ones) until shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn advertise_service_vips_task(
+    engine: kr_bgp::GobgpGrpcEngine,
+    client: kube::Client,
+    node_name: String,
+    defaults: kr_routing::service_vips::AdvertiseDefaults,
+    next_hop: std::net::IpAddr,
+    sync_period: std::time::Duration,
+    cache_sync_timeout: std::time::Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let services = kr_kube_client::spawn_reflector::<Service>(client.clone());
+    let slices = kr_kube_client::spawn_reflector::<EndpointSlice>(client);
+    let (sv, sl) = (services.clone(), slices.clone());
+    let _ = kr_kube_client::wait_with_timeout(
+        async move {
+            let _ = sv.wait_until_ready().await;
+            let _ = sl.wait_until_ready().await;
+        },
+        cache_sync_timeout,
+    )
+    .await;
+
+    let provider = svc_vip_wire::StoreSvcVipProvider::new(services, slices, node_name);
+    let mut advertiser = kr_routing::Advertiser::new();
+    let mut ticker = tokio::time::interval(sync_period);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let vips: Vec<ipnet::IpNet> =
+                    kr_routing::service_vips::advertised_service_vips(&provider.snapshot(), &defaults)
+                        .into_iter()
+                        .collect();
+                if let Err(e) = advertiser.sync(&engine, &vips, next_hop, true).await {
+                    tracing::warn!(error = %e, "service VIP advertisement failed");
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
 }
 
 /// Consume BGP best-path events and install/withdraw kernel routes. Skips the
