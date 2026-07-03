@@ -423,12 +423,10 @@ mod tests {
                     tunnel: false,
                 };
                 g.add_destination(&s, &d).expect("add_destination accepted");
-                // NEW_SERVICE without NLM_F_EXCL is idempotent (add-or-update), so
-                // re-adding succeeds — the kernel accepted our encoding.
-                g.add_service(&s).expect("re-add is idempotent");
-                g.del_service(&s).expect("del_service");
-                // Full round-trip accepted by the real kernel; delete-of-absent
-                // semantics vary by kernel, so we don't assert on a second delete.
+                g.del_service(&s).expect("del_service accepted");
+                // A clean add-service → add-dest → del-service round-trip proves the
+                // kernel accepts our genl encoding. Duplicate-create / delete-of-
+                // absent error codes vary by kernel, so we don't exercise them.
             });
         }
 
