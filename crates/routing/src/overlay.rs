@@ -28,6 +28,94 @@ pub enum Encap {
     Fou,
 }
 
+/// Custom routing table overlay tunnel routes live in (`CustomTableID`).
+pub const CUSTOM_TABLE_ID: u32 = 77;
+/// Name for [`CUSTOM_TABLE_ID`] in `/etc/iproute2/rt_tables`.
+pub const CUSTOM_TABLE_NAME: &str = "kube-router";
+
+/// tunnel link type for a family (`ipip` for v4, `ip6tnl` for v6).
+fn link_type(ipv6: bool) -> &'static str {
+    if ipv6 {
+        "ip6tnl"
+    } else {
+        "ipip"
+    }
+}
+
+/// `ip fou add` args to open the GUE decap port (FoU encapsulation).
+pub fn fou_add_args(port: u16) -> Vec<String> {
+    vec![
+        "fou".into(),
+        "add".into(),
+        "port".into(),
+        port.to_string(),
+        "gue".into(),
+    ]
+}
+
+/// `ip link add` args for the overlay tunnel to `next_hop` sourced at `local`.
+/// FoU wraps IPIP in GUE on `encap_port`; plain IPIP omits the encap options.
+pub fn tunnel_add_args(
+    name: &str,
+    next_hop: IpAddr,
+    local: IpAddr,
+    encap: Encap,
+    encap_port: u16,
+) -> Vec<String> {
+    let ipv6 = next_hop.is_ipv6();
+    let mut a = vec![
+        "link".into(),
+        "add".into(),
+        "name".into(),
+        name.into(),
+        "type".into(),
+        link_type(ipv6).into(),
+        "remote".into(),
+        next_hop.to_string(),
+        "local".into(),
+        local.to_string(),
+    ];
+    if encap == Encap::Fou {
+        let mode = if ipv6 { "ip6ip6" } else { "ipip" };
+        a.extend([
+            "ttl".into(),
+            "225".into(),
+            "encap".into(),
+            "gue".into(),
+            "encap-sport".into(),
+            "auto".into(),
+            "encap-dport".into(),
+            encap_port.to_string(),
+            "mode".into(),
+            mode.into(),
+        ]);
+    }
+    a
+}
+
+/// `ip link set <name> up`.
+pub fn tunnel_up_args(name: &str) -> Vec<String> {
+    vec!["link".into(), "set".into(), name.into(), "up".into()]
+}
+
+/// `ip route add <next_hop>/32 dev <name> table 77` — deliver overlay traffic to
+/// the peer via its tunnel device in the custom table.
+pub fn tunnel_route_args(next_hop: IpAddr, name: &str) -> Vec<String> {
+    let host = match next_hop {
+        IpAddr::V4(a) => format!("{a}/32"),
+        IpAddr::V6(a) => format!("{a}/128"),
+    };
+    vec![
+        "route".into(),
+        "replace".into(),
+        host,
+        "dev".into(),
+        name.into(),
+        "table".into(),
+        CUSTOM_TABLE_ID.to_string(),
+    ]
+}
+
 /// Deterministic tunnel interface name for a next hop. Stable across restarts so
 /// the same peer always maps to the same tunnel device.
 ///
@@ -88,5 +176,43 @@ mod tests {
             OverlayType::Subnet
         ));
         assert!(needs_tunnel(&ip("10.1.0.5"), &subnets, OverlayType::Subnet));
+    }
+
+    #[test]
+    fn ipip_tunnel_add_args_omit_encap() {
+        let a = tunnel_add_args(
+            "kube-tun-abc",
+            ip("10.0.0.2"),
+            ip("10.0.0.1"),
+            Encap::Ipip,
+            5555,
+        );
+        assert_eq!(
+            &a[0..6],
+            &["link", "add", "name", "kube-tun-abc", "type", "ipip"]
+        );
+        assert!(a.contains(&"remote".to_string()) && a.contains(&"10.0.0.2".to_string()));
+        assert!(!a.contains(&"encap".to_string()));
+    }
+
+    #[test]
+    fn fou_tunnel_add_args_include_gue_encap() {
+        let a = tunnel_add_args("t", ip("10.0.0.2"), ip("10.0.0.1"), Encap::Fou, 5555);
+        assert!(a.windows(2).any(|w| w == ["encap", "gue"]));
+        assert!(a.windows(2).any(|w| w == ["encap-dport", "5555"]));
+        assert!(a.windows(2).any(|w| w == ["mode", "ipip"]));
+        assert_eq!(
+            fou_add_args(5555),
+            vec!["fou", "add", "port", "5555", "gue"]
+        );
+    }
+
+    #[test]
+    fn v6_tunnel_uses_ip6tnl_and_route_is_128() {
+        let a = tunnel_add_args("t6", ip("fd00::2"), ip("fd00::1"), Encap::Fou, 5555);
+        assert!(a.windows(2).any(|w| w == ["type", "ip6tnl"]));
+        assert!(a.windows(2).any(|w| w == ["mode", "ip6ip6"]));
+        let r = tunnel_route_args(ip("fd00::2"), "t6");
+        assert!(r.contains(&"fd00::2/128".to_string()) && r.contains(&"77".to_string()));
     }
 }
