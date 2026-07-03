@@ -9,11 +9,13 @@
 pub mod advertise;
 pub mod annotations;
 pub mod controller;
+pub mod external_peers;
 pub mod inject;
 pub mod overlay;
 pub mod peers;
 pub mod pod_egress;
 pub mod podnet;
+pub mod service_vips;
 
 pub use advertise::Advertiser;
 pub use annotations::{parse_node_bgp, ExternalPeer, NodeBgpConfig};
