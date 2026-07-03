@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 
-use kr_bgp::PeerConfig;
+use kr_bgp::{GracefulRestart, PeerConfig};
 
 /// External-peer configuration error.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -39,6 +39,7 @@ pub fn zip_peers(
     passwords: &[String],
     multihop_ttl: Option<u8>,
     local_address: Option<IpAddr>,
+    graceful_restart: Option<GracefulRestart>,
 ) -> Result<Vec<PeerConfig>, PeerParseError> {
     if ips.len() != asns.len() {
         return Err(PeerParseError::CountMismatch {
@@ -75,6 +76,7 @@ pub fn zip_peers(
             password: passwords.get(i).filter(|p| !p.is_empty()).cloned(),
             port: ports.get(i).copied().filter(|p| *p != 0),
             multihop_ttl,
+            graceful_restart,
         })
         .collect())
 }
@@ -96,6 +98,7 @@ mod tests {
             &["".into(), "c2VjcmV0".into()],
             Some(2),
             Some(ip("10.0.0.5")),
+            None,
         )
         .unwrap();
         assert_eq!(peers.len(), 2);
@@ -112,7 +115,7 @@ mod tests {
 
     #[test]
     fn no_optional_lists_is_fine() {
-        let peers = zip_peers(&[ip("192.0.2.1")], &[65001], &[], &[], None, None).unwrap();
+        let peers = zip_peers(&[ip("192.0.2.1")], &[65001], &[], &[], None, None, None).unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].port, None);
         assert_eq!(peers[0].password, None);
@@ -121,7 +124,16 @@ mod tests {
 
     #[test]
     fn ip_asn_count_mismatch_errors() {
-        let err = zip_peers(&[ip("192.0.2.1")], &[65001, 65002], &[], &[], None, None).unwrap_err();
+        let err = zip_peers(
+            &[ip("192.0.2.1")],
+            &[65001, 65002],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err, PeerParseError::CountMismatch { ips: 1, asns: 2 });
     }
 
@@ -132,6 +144,7 @@ mod tests {
             &[65001, 65002],
             &[179],
             &[],
+            None,
             None,
             None,
         )

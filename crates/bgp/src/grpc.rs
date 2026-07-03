@@ -178,8 +178,9 @@ impl GobgpGrpcEngine {
         Ok(())
     }
 
-    /// Both IPv4 and IPv6 unicast afi-safis (gobgp negotiates what the peer supports).
-    fn dual_afi_safis() -> Vec<api::AfiSafi> {
+    /// Both IPv4 and IPv6 unicast afi-safis (gobgp negotiates what the peer
+    /// supports). Enables per-AFI MP-Graceful-Restart when `gr` is set.
+    fn dual_afi_safis(gr: bool) -> Vec<api::AfiSafi> {
         [AFI_IP, AFI_IP6]
             .into_iter()
             .map(|afi| api::AfiSafi {
@@ -189,6 +190,10 @@ impl GobgpGrpcEngine {
                         safi: SAFI_UNICAST,
                     }),
                     enabled: true,
+                }),
+                mp_graceful_restart: gr.then(|| api::MpGracefulRestart {
+                    config: Some(api::MpGracefulRestartConfig { enabled: true }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             })
@@ -250,12 +255,19 @@ impl BgpEngine for GobgpGrpcEngine {
             route_reflector_client: true,
             route_reflector_cluster_id: peer.rr_cluster_id.clone().unwrap_or_default(),
         });
+        let graceful_restart = peer.graceful_restart.map(|gr| api::GracefulRestart {
+            enabled: true,
+            restart_time: gr.restart_time_secs,
+            deferral_time: gr.deferral_time_secs,
+            ..Default::default()
+        });
         let p = api::Peer {
             conf: Some(conf),
             transport: Some(transport),
             ebgp_multihop,
             route_reflector,
-            afi_safis: Self::dual_afi_safis(),
+            graceful_restart,
+            afi_safis: Self::dual_afi_safis(peer.graceful_restart.is_some()),
             ..Default::default()
         };
         self.client()
@@ -404,7 +416,7 @@ mod tests {
 
     #[test]
     fn dual_afi_safis_has_v4_and_v6_unicast() {
-        let afs = GobgpGrpcEngine::dual_afi_safis();
+        let afs = GobgpGrpcEngine::dual_afi_safis(false);
         assert_eq!(afs.len(), 2);
         let fams: Vec<(i32, i32)> = afs
             .iter()

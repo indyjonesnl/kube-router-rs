@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kr_bgp::{BgpEngine, BgpError, PeerConfig};
+use kr_bgp::{BgpEngine, BgpError, GracefulRestart, PeerConfig};
 use kr_observability::{Component, HealthState};
 
 use crate::peers::{derive_ibgp_peers, peer_diff, BgpPeer, NodeBgp};
@@ -28,7 +28,7 @@ pub trait NodeProvider: Send + Sync {
 }
 
 /// Map a derived iBGP peer to the engine's peer config.
-fn to_peer_config(p: &BgpPeer) -> PeerConfig {
+fn to_peer_config(p: &BgpPeer, graceful_restart: Option<GracefulRestart>) -> PeerConfig {
     PeerConfig {
         neighbor: p.neighbor,
         peer_asn: p.peer_asn,
@@ -39,6 +39,7 @@ fn to_peer_config(p: &BgpPeer) -> PeerConfig {
         password: None,
         port: None,
         multihop_ttl: None,
+        graceful_restart,
     }
 }
 
@@ -53,6 +54,8 @@ pub struct RoutesControllerConfig {
     pub enable_ibgp: bool,
     /// `--routes-sync-period`.
     pub sync_period: Duration,
+    /// MP-BGP Graceful Restart applied to all peers, when enabled.
+    pub graceful_restart: Option<GracefulRestart>,
 }
 
 /// The routes controller.
@@ -123,7 +126,9 @@ impl<P: NodeProvider, E: BgpEngine> NetworkRoutesController<P, E> {
     pub async fn reconcile_and_apply(&mut self) -> Result<(usize, usize), BgpError> {
         let (add, remove) = self.reconcile();
         for peer in &add {
-            self.engine.add_peer(&to_peer_config(peer)).await?;
+            self.engine
+                .add_peer(&to_peer_config(peer, self.cfg.graceful_restart))
+                .await?;
         }
         for neighbor in &remove {
             self.engine.delete_peer(*neighbor).await?;
@@ -195,6 +200,7 @@ mod tests {
                 full_mesh: true,
                 enable_ibgp: true,
                 sync_period: Duration::from_secs(300),
+                graceful_restart: None,
             },
             provider,
             engine,
@@ -240,6 +246,7 @@ mod tests {
             password: None,
             port: None,
             multihop_ttl: Some(2),
+            graceful_restart: None,
         };
         let mut c = controller(prov, MockBgpEngine::new()).with_external_peers(vec![ext]);
         assert_eq!(c.apply_external_peers().await.unwrap(), 1);

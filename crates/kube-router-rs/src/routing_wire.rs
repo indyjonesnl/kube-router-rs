@@ -117,11 +117,19 @@ pub fn build_controller<E: kr_bgp::BgpEngine>(
         }
     };
     let local_ip = local.ip;
+    // Graceful Restart applied to all peers when --bgp-graceful-restart is set.
+    let graceful_restart = config
+        .bgp_graceful_restart
+        .then_some(kr_bgp::GracefulRestart {
+            restart_time_secs: config.bgp_graceful_restart_time.as_secs() as u32,
+            deferral_time_secs: config.bgp_graceful_restart_deferral_time.as_secs() as u32,
+        });
     let cfg = RoutesControllerConfig {
         local,
         full_mesh: config.nodes_full_mesh,
         enable_ibgp: config.enable_ibgp,
         sync_period: config.routes_sync_period,
+        graceful_restart,
     };
 
     // External peers from the global --peer-router-* flags (zipped by index).
@@ -138,6 +146,7 @@ pub fn build_controller<E: kr_bgp::BgpEngine>(
         &config.peer_router_passwords,
         ttl,
         Some(local_ip),
+        graceful_restart,
     ) {
         Ok(p) => p,
         Err(e) => {

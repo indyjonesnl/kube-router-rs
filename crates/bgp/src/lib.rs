@@ -18,7 +18,7 @@ pub mod gobgp_api {
     include!(concat!(env!("OUT_DIR"), "/api.rs"));
 }
 
-pub use engine::{BgpEngine, BgpError, GlobalConfig, LoggingEngine, PeerConfig};
+pub use engine::{BgpEngine, BgpError, GlobalConfig, GracefulRestart, LoggingEngine, PeerConfig};
 pub use grpc::{GobgpGrpcEngine, PathEvent};
 pub use path::{Afi, Attr, Path, PathBuilder, Safi};
 pub use policy::{DefinedSet, DefinedSetKind};
