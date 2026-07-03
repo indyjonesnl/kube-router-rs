@@ -43,6 +43,7 @@ pub struct RouteInjector<N: NetlinkOps> {
     local_subnets: Vec<IpNet>,
     overlay: OverlayType,
     table: u32,
+    import_reject: Vec<IpNet>,
     routes: BTreeMap<IpNet, InjectedRoute>,
 }
 
@@ -54,8 +55,24 @@ impl<N: NetlinkOps> RouteInjector<N> {
             local_subnets,
             overlay,
             table,
+            import_reject: Vec::new(),
             routes: BTreeMap::new(),
         }
+    }
+
+    /// Reject learned prefixes contained by any of these
+    /// (`kube-router.io/node.bgp.customimportreject`): they are never installed.
+    pub fn with_import_reject(mut self, reject: Vec<IpNet>) -> Self {
+        self.import_reject = reject;
+        self
+    }
+
+    /// Whether a learned prefix should be rejected on import (contained by a
+    /// reject prefix of the same family).
+    fn is_rejected(&self, prefix: &IpNet) -> bool {
+        self.import_reject
+            .iter()
+            .any(|r| r.contains(&prefix.network()) && prefix.prefix_len() >= r.prefix_len())
     }
 
     /// Number of routes currently in the state map.
@@ -71,6 +88,13 @@ impl<N: NetlinkOps> RouteInjector<N> {
     /// Process a single best-path event.
     pub async fn on_event(&mut self, ev: &BestPath) -> Result<(), NetlinkError> {
         if ev.withdrawal {
+            if let Some(ir) = self.routes.remove(&ev.prefix) {
+                self.nl.route_del(&ir.route).await?;
+            }
+            return Ok(());
+        }
+        // Custom import-reject: drop the learned route (don't install it).
+        if self.is_rejected(&ev.prefix) {
             if let Some(ir) = self.routes.remove(&ev.prefix) {
                 self.nl.route_del(&ir.route).await?;
             }
@@ -116,6 +140,29 @@ mod tests {
             OverlayType::Subnet,
             254,
         )
+    }
+
+    #[tokio::test]
+    async fn import_reject_drops_matching_learned_route() {
+        let mut inj = injector().with_import_reject(vec![net("10.244.0.0/16")]);
+        // Contained by the reject prefix → not installed.
+        inj.on_event(&BestPath {
+            prefix: net("10.244.1.0/24"),
+            next_hop: ip("10.0.0.2"),
+            withdrawal: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(inj.route_count(), 0);
+        // A prefix outside the reject set is still installed.
+        inj.on_event(&BestPath {
+            prefix: net("10.245.1.0/24"),
+            next_hop: ip("10.0.0.2"),
+            withdrawal: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(inj.route_count(), 1);
     }
 
     #[tokio::test]

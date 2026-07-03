@@ -227,6 +227,7 @@ async fn run_routing(
                 rx,
                 local_ip,
                 config.injected_routes_sync_period,
+                bgp_policy.import_reject.clone(),
                 until_shutdown(shutdown_rx.clone()),
             ));
             // Advertise service VIPs (ClusterIP/ExternalIP/LB) to peers when any
@@ -340,6 +341,7 @@ async fn receive_side_inject<F>(
     mut rx: tokio::sync::mpsc::Receiver<kr_bgp::PathEvent>,
     local_ip: Option<std::net::IpAddr>,
     sync_period: std::time::Duration,
+    import_reject: Vec<ipnet::IpNet>,
     stop: F,
 ) where
     F: std::future::Future<Output = ()>,
@@ -349,7 +351,8 @@ async fn receive_side_inject<F>(
         Vec::new(),
         kr_routing::overlay::OverlayType::Subnet,
         254,
-    );
+    )
+    .with_import_reject(import_reject);
     let mut ticker = tokio::time::interval(sync_period);
     tokio::pin!(stop);
     loop {
