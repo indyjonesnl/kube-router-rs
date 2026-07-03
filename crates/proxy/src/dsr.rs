@@ -287,6 +287,25 @@ mod tests {
         assert_ne!(m, generate_fwmark("10.96.0.10-tcp-80", 1));
     }
 
+    // Ported from upstream generateUniqueFWMark behaviour: the FNV-1a hash of the
+    // service key masked to 14 bits is stable and stays within 0x3FFF for a range
+    // of inputs, and salting yields a different value.
+    #[test]
+    fn fwmark_edge_cases_masked_and_salted() {
+        for (ip, proto, port) in [
+            ("10.96.0.1", Protocol::Tcp, 443u16),
+            ("10.96.0.10", Protocol::Udp, 53),
+            ("fd00::1", Protocol::Tcp, 80),
+            ("203.0.113.255", Protocol::Sctp, 65535),
+        ] {
+            let key = service_key(ip, proto, port);
+            let m0 = generate_fwmark(&key, 0);
+            assert!(m0 <= 0x3FFF, "{key} → {m0} exceeds 14 bits");
+            assert_eq!(m0, generate_fwmark(&key, 0), "deterministic");
+            assert_ne!(m0, generate_fwmark(&key, 1), "salt changes value");
+        }
+    }
+
     #[test]
     fn registry_assigns_and_looks_up_both_ways() {
         let mut reg = FwMarkRegistry::new();
