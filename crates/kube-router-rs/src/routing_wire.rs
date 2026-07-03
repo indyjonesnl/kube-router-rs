@@ -111,6 +111,21 @@ impl StoreNodeProvider {
             .find(|n| n.metadata.name.as_deref() == Some(name))
             .and_then(|n| node_to_bgp(n, self.cluster_asn))
     }
+
+    /// The local node's `kube-router.io/peers` YAML annotation, if set.
+    pub fn local_node_peers_annotation(&self, name: &str) -> Option<String> {
+        self.store
+            .state()
+            .iter()
+            .find(|n| n.metadata.name.as_deref() == Some(name))
+            .and_then(|n| {
+                n.metadata
+                    .annotations
+                    .as_ref()?
+                    .get("kube-router.io/peers")
+                    .cloned()
+            })
+    }
 }
 
 impl NodeProvider for StoreNodeProvider {
@@ -165,7 +180,7 @@ pub fn build_controller<E: kr_bgp::BgpEngine>(
         .filter_map(|p| u16::try_from(*p).ok())
         .collect();
     let ttl = (config.peer_router_multihop_ttl > 0).then_some(config.peer_router_multihop_ttl);
-    let external = match kr_routing::external_peers::zip_peers(
+    let mut external = match kr_routing::external_peers::zip_peers(
         &config.peer_router_ips,
         &config.peer_router_asns,
         &ports,
@@ -180,6 +195,16 @@ pub fn build_controller<E: kr_bgp::BgpEngine>(
             Vec::new()
         }
     };
+    // Per-node `kube-router.io/peers` YAML annotation peers (merged with the
+    // global-flag peers above).
+    if let Some(yaml) = provider.local_node_peers_annotation(local_name) {
+        match kr_routing::external_peers::parse_peers_annotation(&yaml, ttl, graceful_restart) {
+            Ok(mut p) => external.append(&mut p),
+            Err(e) => {
+                tracing::warn!(error = %e, "invalid kube-router.io/peers annotation; ignoring")
+            }
+        }
+    }
 
     Some(NetworkRoutesController::new(cfg, provider, engine).with_external_peers(external))
 }

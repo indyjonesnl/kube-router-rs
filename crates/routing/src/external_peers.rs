@@ -5,6 +5,7 @@
 use std::net::IpAddr;
 
 use kr_bgp::{GracefulRestart, PeerConfig};
+use serde::Deserialize;
 
 /// External-peer configuration error.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -27,6 +28,60 @@ pub enum PeerParseError {
         /// Peer count.
         want: usize,
     },
+    /// The `kube-router.io/peers` YAML annotation was malformed.
+    #[error("invalid peers annotation: {0}")]
+    Yaml(String),
+}
+
+/// One entry of the `kube-router.io/peers` YAML annotation (mirrors
+/// `pkg/bgp.PeerConfig`).
+#[derive(Debug, Deserialize)]
+struct PeerEntry {
+    remoteip: String,
+    remoteasn: u32,
+    #[serde(default)]
+    localip: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    port: Option<u32>,
+}
+
+/// Parse the per-node `kube-router.io/peers` YAML annotation into external
+/// `PeerConfig`s (a YAML list of `{remoteip, remoteasn, localip?, password?,
+/// port?}`). Applies the global multihop TTL + graceful restart.
+pub fn parse_peers_annotation(
+    yaml: &str,
+    multihop_ttl: Option<u8>,
+    graceful_restart: Option<GracefulRestart>,
+) -> Result<Vec<PeerConfig>, PeerParseError> {
+    let entries: Vec<PeerEntry> =
+        serde_yaml_ng::from_str(yaml).map_err(|e| PeerParseError::Yaml(e.to_string()))?;
+    entries
+        .into_iter()
+        .map(|e| {
+            let neighbor: IpAddr = e
+                .remoteip
+                .parse()
+                .map_err(|_| PeerParseError::Yaml(format!("bad remoteip: {}", e.remoteip)))?;
+            let local_address = e.localip.as_deref().and_then(|s| s.parse().ok());
+            Ok(PeerConfig {
+                neighbor,
+                peer_asn: e.remoteasn,
+                is_external: true,
+                rr_client: false,
+                rr_cluster_id: None,
+                local_address,
+                password: e.password.filter(|p| !p.is_empty()),
+                port: e
+                    .port
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|p| *p != 0),
+                multihop_ttl,
+                graceful_restart,
+            })
+        })
+        .collect()
 }
 
 /// Build external `PeerConfig`s by zipping the peer IP/ASN lists (and optional
@@ -135,6 +190,38 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, PeerParseError::CountMismatch { ips: 1, asns: 2 });
+    }
+
+    #[test]
+    fn parses_peers_yaml_annotation() {
+        let yaml = "\
+- remoteip: 192.0.2.1
+  remoteasn: 65001
+  password: c2VjcmV0
+  port: 1790
+- remoteip: 192.0.2.2
+  remoteasn: 65002
+  localip: 10.0.0.9";
+        let peers = parse_peers_annotation(yaml, Some(4), None).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].neighbor, ip("192.0.2.1"));
+        assert_eq!(peers[0].peer_asn, 65001);
+        assert_eq!(peers[0].password.as_deref(), Some("c2VjcmV0"));
+        assert_eq!(peers[0].port, Some(1790));
+        assert_eq!(peers[0].multihop_ttl, Some(4));
+        assert!(peers[0].is_external);
+        assert_eq!(peers[1].local_address, Some(ip("10.0.0.9")));
+        assert_eq!(peers[1].port, None);
+    }
+
+    #[test]
+    fn malformed_peers_annotation_errors() {
+        assert!(matches!(
+            parse_peers_annotation("not: [a, valid, list", None, None),
+            Err(PeerParseError::Yaml(_))
+        ));
+        // Missing required remoteasn.
+        assert!(parse_peers_annotation("- remoteip: 192.0.2.1", None, None).is_err());
     }
 
     #[test]
