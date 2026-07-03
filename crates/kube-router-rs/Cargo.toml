@@ -20,6 +20,7 @@ kr-cni = { workspace = true }
 kr-netlink-sys = { workspace = true }
 kr-netpol = { workspace = true }
 kr-proxy = { workspace = true }
+kr-lballoc = { workspace = true }
 ipnet = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

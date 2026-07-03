@@ -10,6 +10,7 @@
 //! loadbalancer controllers wire in their respective user-story tasks.
 
 mod cleanup;
+mod lballoc_wire;
 mod netpol_wire;
 mod orchestrate;
 mod proxy_wire;
@@ -110,6 +111,17 @@ async fn main() -> anyhow::Result<()> {
         controllers.push(tokio::spawn(async move {
             if let Err(e) = run_serviceproxy(cfg, health2, metrics2, rx).await {
                 tracing::error!(error = %e, "service-proxy controller exited with error");
+            }
+        }));
+    }
+
+    if config.run_loadbalancer {
+        let cfg = config.clone();
+        let health2 = health.clone();
+        let rx = shutdown_rx.clone();
+        controllers.push(tokio::spawn(async move {
+            if let Err(e) = run_loadbalancer(cfg, health2, rx).await {
+                tracing::error!(error = %e, "loadbalancer controller exited with error");
             }
         }));
     }
@@ -544,6 +556,85 @@ async fn run_serviceproxy(
         }
     })
     .await;
+    Ok(())
+}
+
+/// Build the client + Service informer and run the LoadBalancer allocator:
+/// Lease-elected, it assigns pool IPs to owned `type: LoadBalancer` services.
+async fn run_loadbalancer(
+    config: KubeRouterConfig,
+    health: Arc<Mutex<HealthState>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    use kr_lballoc::election::{LeaderElector, RETRY_PERIOD};
+    use kr_lballoc::{IpRanges, LbAllocator};
+    use kr_observability::Component;
+
+    let client =
+        kr_kube_client::build_client(Some(&config.kubeconfig), Some(&config.master)).await?;
+    let services = kr_kube_client::spawn_reflector::<Service>(client.clone());
+    let sv = services.clone();
+    kr_kube_client::wait_with_timeout(
+        async move {
+            let _ = sv.wait_until_ready().await;
+        },
+        config.cache_sync_timeout,
+    )
+    .await?;
+
+    // Split the configured LB ranges by family.
+    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+    for cidr in &config.loadbalancer_ip_range {
+        if let Ok(net) = cidr.parse::<ipnet::IpNet>() {
+            match net {
+                ipnet::IpNet::V4(_) => v4.push(net),
+                ipnet::IpNet::V6(_) => v6.push(net),
+            }
+        }
+    }
+
+    let provider = lballoc_wire::StoreLbServiceProvider::new(services);
+    let updater = lballoc_wire::KubeStatusUpdater::new(client.clone());
+    let mut allocator = LbAllocator::new(
+        IpRanges::new(v4),
+        IpRanges::new(v6),
+        config.loadbalancer_default_class,
+        provider,
+        updater,
+    );
+
+    // Lease election: single allocator cluster-wide.
+    let namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "kube-system".into());
+    let identity = std::env::var("POD_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "kube-router-rs".into());
+    let lease = lballoc_wire::KubeLease::new(client, &namespace, identity);
+    let mut elector = LeaderElector::new(lease);
+
+    let mut election_tick = tokio::time::interval(RETRY_PERIOD);
+    let mut sync_tick = tokio::time::interval(config.loadbalancer_sync_period);
+    loop {
+        tokio::select! {
+            _ = election_tick.tick() => {
+                if let Some(became) = elector.tick().await {
+                    tracing::info!(leader = became, "loadbalancer leadership changed");
+                }
+            }
+            _ = sync_tick.tick() => {
+                if elector.is_leader() {
+                    if let Err(e) = allocator.reconcile().await {
+                        tracing::warn!(error = %e, "loadbalancer allocation failed");
+                    }
+                }
+                if let Ok(mut h) = health.lock() {
+                    h.heartbeat(Component::LoadBalancer, Instant::now());
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
     Ok(())
 }
 

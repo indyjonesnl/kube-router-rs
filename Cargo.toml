@@ -35,6 +35,7 @@ kr-routing = { path = "crates/routing" }
 kr-cni = { path = "crates/cni" }
 kr-netpol = { path = "crates/netpol" }
 kr-proxy = { path = "crates/proxy" }
+kr-lballoc = { path = "crates/lballoc" }
 
 # Shared external dependencies
 anyhow = "1"

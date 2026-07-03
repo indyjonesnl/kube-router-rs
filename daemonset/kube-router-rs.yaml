@@ -26,7 +26,7 @@ rules:
     verbs: [get, create, update]
   - apiGroups: [""]
     resources: [services/status]
-    verbs: [update]
+    verbs: [get, update]
   - apiGroups: ["discovery.k8s.io"]
     resources: [endpointslices]
     verbs: [get, list, watch]

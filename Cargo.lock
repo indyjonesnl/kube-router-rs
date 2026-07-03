@@ -1106,6 +1106,13 @@ dependencies = [
 [[package]]
 name = "kr-lballoc"
 version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "ipnet",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "kr-netlink-sys"
@@ -1249,6 +1256,7 @@ dependencies = [
  "kr-common",
  "kr-config",
  "kr-kube-client",
+ "kr-lballoc",
  "kr-netlink-sys",
  "kr-netpol",
  "kr-observability",
