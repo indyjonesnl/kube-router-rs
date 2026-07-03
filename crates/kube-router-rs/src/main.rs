@@ -253,11 +253,21 @@ async fn run_routing(
                 ))),
                 _ => None,
             };
+            let stop_engine = we.clone();
             let watch = tokio::spawn(watch_task(we, tx, shutdown_rx.clone()));
             if let Some(mut c) = bgp {
                 c.run(health, until_shutdown(shutdown_rx)).await;
             } else {
                 until_shutdown(shutdown_rx).await;
+            }
+            // Graceful teardown order: controllers stopped above → send BGP
+            // shutdown (StopBgp) so peers get a clean notification → stop the
+            // watch/advertise tasks → kill gobgpd (supervisor.terminate below).
+            {
+                use kr_bgp::BgpEngine;
+                if let Err(e) = stop_engine.stop().await {
+                    tracing::warn!(error = %e, "BGP StopBgp on shutdown failed");
+                }
             }
             inject.abort();
             watch.abort();
