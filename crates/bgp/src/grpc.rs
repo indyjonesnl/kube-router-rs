@@ -55,7 +55,7 @@ fn origin_attr() -> api::Attribute {
 /// attribute, IPv6 an MP_REACH_NLRI attribute (mirrors `crate::path::PathBuilder`).
 fn build_path(p: &Path) -> api::Path {
     let nlri = prefix_nlri(p);
-    let (afi, pattrs) = match p.afi {
+    let (afi, mut pattrs) = match p.afi {
         Afi::Ip => (
             AFI_IP,
             vec![
@@ -81,6 +81,31 @@ fn build_path(p: &Path) -> api::Path {
             ],
         ),
     };
+    // COMMUNITIES + AS_PATH prepend attributes (from node BGP policy).
+    for attr in &p.attrs {
+        match attr {
+            crate::path::Attr::Communities(comms) if !comms.is_empty() => {
+                pattrs.push(api::Attribute {
+                    attr: Some(api::attribute::Attr::Communities(
+                        api::CommunitiesAttribute {
+                            communities: comms.clone(),
+                        },
+                    )),
+                });
+            }
+            crate::path::Attr::AsPathPrepend { asn, repeat } if *repeat > 0 => {
+                pattrs.push(api::Attribute {
+                    attr: Some(api::attribute::Attr::AsPath(api::AsPathAttribute {
+                        segments: vec![api::AsSegment {
+                            r#type: api::as_segment::Type::AsSequence as i32,
+                            numbers: vec![*asn; *repeat as usize],
+                        }],
+                    })),
+                });
+            }
+            _ => {}
+        }
+    }
     api::Path {
         nlri: Some(nlri),
         pattrs,
@@ -178,8 +203,9 @@ impl GobgpGrpcEngine {
         Ok(())
     }
 
-    /// Both IPv4 and IPv6 unicast afi-safis (gobgp negotiates what the peer supports).
-    fn dual_afi_safis() -> Vec<api::AfiSafi> {
+    /// Both IPv4 and IPv6 unicast afi-safis (gobgp negotiates what the peer
+    /// supports). Enables per-AFI MP-Graceful-Restart when `gr` is set.
+    fn dual_afi_safis(gr: bool) -> Vec<api::AfiSafi> {
         [AFI_IP, AFI_IP6]
             .into_iter()
             .map(|afi| api::AfiSafi {
@@ -189,6 +215,10 @@ impl GobgpGrpcEngine {
                         safi: SAFI_UNICAST,
                     }),
                     enabled: true,
+                }),
+                mp_graceful_restart: gr.then(|| api::MpGracefulRestart {
+                    config: Some(api::MpGracefulRestartConfig { enabled: true }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             })
@@ -250,12 +280,19 @@ impl BgpEngine for GobgpGrpcEngine {
             route_reflector_client: true,
             route_reflector_cluster_id: peer.rr_cluster_id.clone().unwrap_or_default(),
         });
+        let graceful_restart = peer.graceful_restart.map(|gr| api::GracefulRestart {
+            enabled: true,
+            restart_time: gr.restart_time_secs,
+            deferral_time: gr.deferral_time_secs,
+            ..Default::default()
+        });
         let p = api::Peer {
             conf: Some(conf),
             transport: Some(transport),
             ebgp_multihop,
             route_reflector,
-            afi_safis: Self::dual_afi_safis(),
+            graceful_restart,
+            afi_safis: Self::dual_afi_safis(peer.graceful_restart.is_some()),
             ..Default::default()
         };
         self.client()
@@ -404,7 +441,7 @@ mod tests {
 
     #[test]
     fn dual_afi_safis_has_v4_and_v6_unicast() {
-        let afs = GobgpGrpcEngine::dual_afi_safis();
+        let afs = GobgpGrpcEngine::dual_afi_safis(false);
         assert_eq!(afs.len(), 2);
         let fams: Vec<(i32, i32)> = afs
             .iter()

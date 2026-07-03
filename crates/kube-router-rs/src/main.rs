@@ -10,10 +10,12 @@
 //! loadbalancer controllers wire in their respective user-story tasks.
 
 mod cleanup;
+mod lballoc_wire;
 mod netpol_wire;
 mod orchestrate;
 mod proxy_wire;
 mod routing_wire;
+mod svc_vip_wire;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -114,6 +116,17 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
+    if config.run_loadbalancer {
+        let cfg = config.clone();
+        let health2 = health.clone();
+        let rx = shutdown_rx.clone();
+        controllers.push(tokio::spawn(async move {
+            if let Err(e) = run_loadbalancer(cfg, health2, rx).await {
+                tracing::error!(error = %e, "loadbalancer controller exited with error");
+            }
+        }));
+    }
+
     orchestrate::wait_for_shutdown().await;
     tracing::info!("shutdown signal received; stopping");
     let _ = shutdown_tx.send(true);
@@ -147,7 +160,7 @@ async fn run_routing(
 ) -> anyhow::Result<()> {
     let client =
         kr_kube_client::build_client(Some(&config.kubeconfig), Some(&config.master)).await?;
-    let store = kr_kube_client::spawn_reflector::<Node>(client);
+    let store = kr_kube_client::spawn_reflector::<Node>(client.clone());
 
     let store_for_ready = store.clone();
     kr_kube_client::wait_with_timeout(
@@ -161,6 +174,9 @@ async fn run_routing(
     let name = routing_wire::resolve_node_name(&config.hostname_override).ok_or_else(|| {
         anyhow::anyhow!("cannot determine node name; set --hostname-override or NODE_NAME")
     })?;
+
+    // Node BGP export policy (communities + AS-path prepend) from annotations.
+    let bgp_policy = routing_wire::local_node_bgp_policy(&store, &name);
 
     // CNI plugins + conflist (so kubelet's CNI becomes ready) + IP forwarding.
     let route_provider = routing_wire::StoreNodeRouteProvider::new(store.clone());
@@ -211,16 +227,53 @@ async fn run_routing(
                 rx,
                 local_ip,
                 config.injected_routes_sync_period,
+                bgp_policy.import_reject.clone(),
                 until_shutdown(shutdown_rx.clone()),
             ));
+            // Advertise service VIPs (ClusterIP/ExternalIP/LB) to peers when any
+            // --advertise-*-ip is enabled.
+            let advertise_any = config.advertise_cluster_ip
+                || config.advertise_external_ip
+                || config.advertise_loadbalancer_ip;
+            let vip = match (advertise_any, local_ip) {
+                (true, Some(nh)) => Some(tokio::spawn(advertise_service_vips_task(
+                    we.clone(),
+                    client,
+                    name.clone(),
+                    kr_routing::service_vips::AdvertiseDefaults {
+                        cluster: config.advertise_cluster_ip,
+                        external: config.advertise_external_ip,
+                        loadbalancer: config.advertise_loadbalancer_ip,
+                    },
+                    nh,
+                    config.routes_sync_period,
+                    config.cache_sync_timeout,
+                    (bgp_policy.communities.clone(), bgp_policy.path_prepend),
+                    shutdown_rx.clone(),
+                ))),
+                _ => None,
+            };
+            let stop_engine = we.clone();
             let watch = tokio::spawn(watch_task(we, tx, shutdown_rx.clone()));
             if let Some(mut c) = bgp {
                 c.run(health, until_shutdown(shutdown_rx)).await;
             } else {
                 until_shutdown(shutdown_rx).await;
             }
+            // Graceful teardown order: controllers stopped above → send BGP
+            // shutdown (StopBgp) so peers get a clean notification → stop the
+            // watch/advertise tasks → kill gobgpd (supervisor.terminate below).
+            {
+                use kr_bgp::BgpEngine;
+                if let Err(e) = stop_engine.stop().await {
+                    tracing::warn!(error = %e, "BGP StopBgp on shutdown failed");
+                }
+            }
             inject.abort();
             watch.abort();
+            if let Some(v) = vip {
+                v.abort();
+            }
         }
         // Logging engine: flat-L2 direct routes via podnet.
         None => {
@@ -244,12 +297,61 @@ async fn run_routing(
     Ok(())
 }
 
+/// Periodically compute the node's advertised service-VIP set and reconcile it
+/// to the BGP engine (add new VIPs, withdraw removed ones) until shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn advertise_service_vips_task(
+    engine: kr_bgp::GobgpGrpcEngine,
+    client: kube::Client,
+    node_name: String,
+    defaults: kr_routing::service_vips::AdvertiseDefaults,
+    next_hop: std::net::IpAddr,
+    sync_period: std::time::Duration,
+    cache_sync_timeout: std::time::Duration,
+    policy_attrs: (Vec<u32>, Option<(u32, u8)>),
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let services = kr_kube_client::spawn_reflector::<Service>(client.clone());
+    let slices = kr_kube_client::spawn_reflector::<EndpointSlice>(client);
+    let (sv, sl) = (services.clone(), slices.clone());
+    let _ = kr_kube_client::wait_with_timeout(
+        async move {
+            let _ = sv.wait_until_ready().await;
+            let _ = sl.wait_until_ready().await;
+        },
+        cache_sync_timeout,
+    )
+    .await;
+
+    let provider = svc_vip_wire::StoreSvcVipProvider::new(services, slices, node_name);
+    let mut advertiser =
+        kr_routing::Advertiser::new().with_attributes(policy_attrs.0, policy_attrs.1);
+    let mut ticker = tokio::time::interval(sync_period);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let vips: Vec<ipnet::IpNet> =
+                    kr_routing::service_vips::advertised_service_vips(&provider.snapshot(), &defaults)
+                        .into_iter()
+                        .collect();
+                if let Err(e) = advertiser.sync(&engine, &vips, next_hop, true).await {
+                    tracing::warn!(error = %e, "service VIP advertisement failed");
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
+}
+
 /// Consume BGP best-path events and install/withdraw kernel routes. Skips the
 /// node's own routes (next hop == local IP). Periodically re-syncs.
 async fn receive_side_inject<F>(
     mut rx: tokio::sync::mpsc::Receiver<kr_bgp::PathEvent>,
     local_ip: Option<std::net::IpAddr>,
     sync_period: std::time::Duration,
+    import_reject: Vec<ipnet::IpNet>,
     stop: F,
 ) where
     F: std::future::Future<Output = ()>,
@@ -259,7 +361,8 @@ async fn receive_side_inject<F>(
         Vec::new(),
         kr_routing::overlay::OverlayType::Subnet,
         254,
-    );
+    )
+    .with_import_reject(import_reject);
     let mut ticker = tokio::time::interval(sync_period);
     tokio::pin!(stop);
     loop {
@@ -544,6 +647,85 @@ async fn run_serviceproxy(
         }
     })
     .await;
+    Ok(())
+}
+
+/// Build the client + Service informer and run the LoadBalancer allocator:
+/// Lease-elected, it assigns pool IPs to owned `type: LoadBalancer` services.
+async fn run_loadbalancer(
+    config: KubeRouterConfig,
+    health: Arc<Mutex<HealthState>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    use kr_lballoc::election::{LeaderElector, RETRY_PERIOD};
+    use kr_lballoc::{IpRanges, LbAllocator};
+    use kr_observability::Component;
+
+    let client =
+        kr_kube_client::build_client(Some(&config.kubeconfig), Some(&config.master)).await?;
+    let services = kr_kube_client::spawn_reflector::<Service>(client.clone());
+    let sv = services.clone();
+    kr_kube_client::wait_with_timeout(
+        async move {
+            let _ = sv.wait_until_ready().await;
+        },
+        config.cache_sync_timeout,
+    )
+    .await?;
+
+    // Split the configured LB ranges by family.
+    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+    for cidr in &config.loadbalancer_ip_range {
+        if let Ok(net) = cidr.parse::<ipnet::IpNet>() {
+            match net {
+                ipnet::IpNet::V4(_) => v4.push(net),
+                ipnet::IpNet::V6(_) => v6.push(net),
+            }
+        }
+    }
+
+    let provider = lballoc_wire::StoreLbServiceProvider::new(services);
+    let updater = lballoc_wire::KubeStatusUpdater::new(client.clone());
+    let mut allocator = LbAllocator::new(
+        IpRanges::new(v4),
+        IpRanges::new(v6),
+        config.loadbalancer_default_class,
+        provider,
+        updater,
+    );
+
+    // Lease election: single allocator cluster-wide.
+    let namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "kube-system".into());
+    let identity = std::env::var("POD_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "kube-router-rs".into());
+    let lease = lballoc_wire::KubeLease::new(client, &namespace, identity);
+    let mut elector = LeaderElector::new(lease);
+
+    let mut election_tick = tokio::time::interval(RETRY_PERIOD);
+    let mut sync_tick = tokio::time::interval(config.loadbalancer_sync_period);
+    loop {
+        tokio::select! {
+            _ = election_tick.tick() => {
+                if let Some(became) = elector.tick().await {
+                    tracing::info!(leader = became, "loadbalancer leadership changed");
+                }
+            }
+            _ = sync_tick.tick() => {
+                if elector.is_leader() {
+                    if let Err(e) = allocator.reconcile().await {
+                        tracing::warn!(error = %e, "loadbalancer allocation failed");
+                    }
+                }
+                if let Ok(mut h) = health.lock() {
+                    h.heartbeat(Component::LoadBalancer, Instant::now());
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
     Ok(())
 }
 

@@ -7,6 +7,10 @@ license.workspace = true
 
 [features]
 mock = []
+# Root-only tests that unshare a network namespace and drive real kernel state
+# (IPVS via genetlink). Run with `cargo test -p kr-proxy --features privileged`
+# as root. Skipped from the normal suite (mirrors upstream's `-tags privileged`).
+privileged = []
 
 [dependencies]
 kr-common = { workspace = true }
@@ -17,6 +21,7 @@ async-trait = "0.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["process", "time", "macros", "sync"] }
+libc = "0.2"
 
 [dev-dependencies]
 kr-netlink-sys = { workspace = true, features = ["mock"] }

@@ -1,0 +1,84 @@
+name: release
+
+# Versioned releases: a container image on GHCR built from the repo Dockerfile
+# (multi-stage: cargo build --release --workspace -> Debian runtime with iptables/
+# ipset/ipvsadm/conntrack/CNI dirs). The [workspace.package] version is the single
+# source of truth; a `vX.Y.Z` tag MUST match it.
+#
+# amd64 only: the image bundles a full Rust workspace build; cross-building it for
+# arm64 under QEMU is slow/fragile and no consumer needs arm64 yet. Add arm64 here
+# when a consumer does.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push image to GHCR (false = build-only dry run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # create GitHub Release
+  packages: write # push to GHCR
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: build + push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The git tag and the crate version are one thing. A tag push whose name
+      # doesn't match [workspace.package] version is a mistake — fail loudly rather
+      # than ship an image whose version lies. (Skipped on dry runs, which have no tag.)
+      - name: Verify git tag matches workspace version
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate_ver="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml)"
+          echo "tag=$tag workspace version=$crate_ver"
+          if [ "$tag" != "$crate_ver" ]; then
+            echo "::error::git tag v$tag != [workspace.package] version $crate_ver — bump Cargo.toml before tagging" >&2
+            exit 1
+          fi
+
+      - name: Compute version
+        id: ver
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && VERSION="dev-${GITHUB_SHA::8}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # push on a tag, or a manual run with publish=true; a plain dispatch is a
+      # build-only dry run (proves the image builds without publishing).
+      - name: Build + push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' || inputs.publish }}
+          tags: |
+            ghcr.io/indyjonesnl/kube-router-rs:${{ steps.ver.outputs.version }}
+            ghcr.io/indyjonesnl/kube-router-rs:latest
+            ghcr.io/indyjonesnl/kube-router-rs:${{ github.sha }}
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

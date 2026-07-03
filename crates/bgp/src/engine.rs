@@ -28,6 +28,15 @@ pub struct GlobalConfig {
     pub listen_addresses: Vec<IpAddr>,
 }
 
+/// MP-BGP Graceful Restart parameters for a peer (`--bgp-graceful-restart`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GracefulRestart {
+    /// Advertised restart time (seconds).
+    pub restart_time_secs: u32,
+    /// Deferral time before selecting best paths after restart (seconds).
+    pub deferral_time_secs: u32,
+}
+
 /// A BGP neighbor to configure (maps to GoBGP `AddPeer`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
@@ -49,6 +58,8 @@ pub struct PeerConfig {
     pub port: Option<u16>,
     /// Optional eBGP multihop TTL.
     pub multihop_ttl: Option<u8>,
+    /// MP-BGP Graceful Restart, when enabled.
+    pub graceful_restart: Option<GracefulRestart>,
 }
 
 /// BGP engine errors.
@@ -213,6 +224,7 @@ mod tests {
             password: None,
             port: None,
             multihop_ttl: None,
+            graceful_restart: None,
         })
         .await
         .unwrap();

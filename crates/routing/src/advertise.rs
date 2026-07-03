@@ -17,12 +17,22 @@ use kr_bgp::{BgpEngine, BgpError, PathBuilder};
 #[derive(Debug, Default)]
 pub struct Advertiser {
     advertised: BTreeSet<IpNet>,
+    communities: Vec<u32>,
+    as_prepend: Option<(u32, u8)>,
 }
 
 impl Advertiser {
     /// New advertiser with nothing advertised yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach node BGP-policy export attributes (COMMUNITIES + AS-path prepend)
+    /// to every advertised path.
+    pub fn with_attributes(mut self, communities: Vec<u32>, as_prepend: Option<(u32, u8)>) -> Self {
+        self.communities = communities;
+        self.as_prepend = as_prepend;
+        self
     }
 
     /// Currently-advertised prefixes.
@@ -50,9 +60,11 @@ impl Advertiser {
         let to_withdraw: Vec<IpNet> = self.advertised.difference(&desired_set).copied().collect();
 
         for prefix in &to_add {
-            engine
-                .add_path(&PathBuilder::new(*prefix, next_hop).build())
-                .await?;
+            let mut b = PathBuilder::new(*prefix, next_hop).communities(self.communities.clone());
+            if let Some((asn, repeat)) = self.as_prepend {
+                b = b.as_path_prepend(asn, repeat);
+            }
+            engine.add_path(&b.build()).await?;
         }
         for prefix in &to_withdraw {
             let path = PathBuilder::new(*prefix, next_hop).withdrawal(true).build();

@@ -35,15 +35,20 @@ pub fn components_for(config: &KubeRouterConfig) -> Vec<(Component, Duration)> {
         out.push((Component::NetworkPolicy, config.iptables_sync_period));
     }
     if config.run_service_proxy {
+        // NetworkServices only. Hairpin SNAT is performed *inside* the service-proxy
+        // sync loop (the same loop that heartbeats NetworkServices) — it is not a
+        // separate controller and nothing emits a Hairpin heartbeat, so registering
+        // it here left /healthz permanently 500 (→ liveness SIGTERM every sync
+        // window). See kr_proxy::sync::run.
         out.push((Component::NetworkServices, config.ipvs_sync_period));
-        out.push((Component::Hairpin, config.ipvs_sync_period));
     }
     if config.run_loadbalancer {
         out.push((Component::LoadBalancer, config.loadbalancer_sync_period));
     }
-    if config.metrics_port != 0 {
-        out.push((Component::Metrics, Duration::from_secs(3)));
-    }
+    // NOTE: Component::Metrics is intentionally NOT registered. The metrics HTTP
+    // surface is a passive endpoint, not a controller with a heartbeating sync loop;
+    // registering it (as an earlier version did when --metrics-port was set) made
+    // /healthz permanently 500 for the same reason as Hairpin above.
     out
 }
 
@@ -128,10 +133,14 @@ mod tests {
     }
 
     #[test]
-    fn metrics_component_when_port_set() {
-        let c = cfg(&["--metrics-port=8080"]);
+    fn metrics_and_hairpin_not_registered_as_health_components() {
+        // Neither has a heartbeating sync loop; registering them would leave
+        // /healthz permanently 500. (Regression guard for the liveness-restart bug.)
+        let c = cfg(&["--metrics-port=8080", "--run-service-proxy=true"]);
         let comps: Vec<_> = components_for(&c).into_iter().map(|(c, _)| c).collect();
-        assert!(comps.contains(&Component::Metrics));
+        assert!(!comps.contains(&Component::Metrics));
+        assert!(!comps.contains(&Component::Hairpin));
+        assert!(comps.contains(&Component::NetworkServices));
     }
 
     #[test]

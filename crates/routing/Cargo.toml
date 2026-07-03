@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
 kr-common = { workspace = true }
 kr-bgp = { workspace = true }
 kr-netlink-sys = { workspace = true }

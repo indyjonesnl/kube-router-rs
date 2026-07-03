@@ -350,6 +350,34 @@ impl SystemIpvs {
         Self
     }
 
+    /// Run a genetlink IPVS operation, returning whether it was handled (so the
+    /// `ipvsadm` fallback can be skipped). Opening the socket is best-effort.
+    fn via_genl<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(&mut crate::genetlink::Genl) -> std::io::Result<()>,
+    {
+        match crate::genetlink::Genl::open() {
+            Ok(mut g) => match f(&mut g) {
+                Ok(()) => {
+                    tracing::debug!("ipvs: programmed via genetlink");
+                    true
+                }
+                Err(e) if matches!(e.raw_os_error(), Some(17) | Some(2)) => {
+                    tracing::debug!("ipvs: genetlink idempotent ({e})");
+                    true
+                }
+                Err(e) => {
+                    tracing::debug!("ipvs: genetlink failed ({e}); falling back to ipvsadm");
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::debug!("ipvs: genetlink unavailable ({e}); using ipvsadm");
+                false
+            }
+        }
+    }
+
     async fn run(&self, args: &[String]) -> Result<(), IpvsError> {
         let out = tokio::process::Command::new("ipvsadm")
             .args(args)
@@ -385,9 +413,15 @@ impl SystemIpvs {
 #[async_trait]
 impl IpvsOps for SystemIpvs {
     async fn add_service(&self, svc: &IpvsService) -> Result<(), IpvsError> {
+        if self.via_genl(|g| g.add_service(svc)) {
+            return Ok(());
+        }
         self.run(&add_service_args(svc)).await
     }
     async fn del_service(&self, svc: &IpvsService) -> Result<(), IpvsError> {
+        if self.via_genl(|g| g.del_service(svc)) {
+            return Ok(());
+        }
         self.run(&del_service_args(svc)).await
     }
     async fn add_destination(
@@ -395,6 +429,9 @@ impl IpvsOps for SystemIpvs {
         svc: &IpvsService,
         dst: &IpvsDestination,
     ) -> Result<(), IpvsError> {
+        if self.via_genl(|g| g.add_destination(svc, dst)) {
+            return Ok(());
+        }
         self.run(&add_dest_args(svc, dst)).await
     }
     async fn del_destination(
@@ -402,6 +439,9 @@ impl IpvsOps for SystemIpvs {
         svc: &IpvsService,
         dst: &IpvsDestination,
     ) -> Result<(), IpvsError> {
+        if self.via_genl(|g| g.del_destination(svc, dst)) {
+            return Ok(());
+        }
         self.run(&del_dest_args(svc, dst)).await
     }
     async fn update_destination(
@@ -422,6 +462,9 @@ impl IpvsOps for SystemIpvs {
         scheduler: Scheduler,
         persistent: Option<u32>,
     ) -> Result<(), IpvsError> {
+        if self.via_genl(|g| g.add_fwmark_service(fwmark, scheduler, persistent)) {
+            return Ok(());
+        }
         self.run(&add_fwmark_service_args(fwmark, scheduler, persistent))
             .await
     }
@@ -430,6 +473,9 @@ impl IpvsOps for SystemIpvs {
         fwmark: u32,
         dst: &IpvsDestination,
     ) -> Result<(), IpvsError> {
+        if self.via_genl(|g| g.add_fwmark_destination(fwmark, dst)) {
+            return Ok(());
+        }
         self.run(&add_fwmark_dest_args(fwmark, dst)).await
     }
     async fn flush_conntrack_udp(&self, addr: IpAddr, port: u16) -> Result<(), IpvsError> {
@@ -661,6 +707,21 @@ mod tests {
         ipvs.del_service(&svc()).await.unwrap();
         assert_eq!(ipvs.service_count(), 0);
         assert!(ipvs.destinations(&svc()).is_empty());
+    }
+
+    #[test]
+    fn proto_flag_covers_all_families() {
+        // Ported: ipvsadm protocol flags for TCP/UDP/SCTP.
+        let s = |p: Protocol| {
+            add_service_args(&IpvsService {
+                protocol: p,
+                ..svc()
+            })[1]
+                .clone()
+        };
+        assert_eq!(s(Protocol::Tcp), "-t");
+        assert_eq!(s(Protocol::Udp), "-u");
+        assert_eq!(s(Protocol::Sctp), "--sctp-service");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 pub mod dsr;
 pub mod firewall;
+pub mod genetlink;
 pub mod graceful;
 pub mod hairpin;
 pub mod ipvs;

@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kr_bgp::{BgpEngine, BgpError, PeerConfig};
+use kr_bgp::{BgpEngine, BgpError, GracefulRestart, PeerConfig};
 use kr_observability::{Component, HealthState};
 
 use crate::peers::{derive_ibgp_peers, peer_diff, BgpPeer, NodeBgp};
@@ -28,7 +28,7 @@ pub trait NodeProvider: Send + Sync {
 }
 
 /// Map a derived iBGP peer to the engine's peer config.
-fn to_peer_config(p: &BgpPeer) -> PeerConfig {
+fn to_peer_config(p: &BgpPeer, graceful_restart: Option<GracefulRestart>) -> PeerConfig {
     PeerConfig {
         neighbor: p.neighbor,
         peer_asn: p.peer_asn,
@@ -39,6 +39,7 @@ fn to_peer_config(p: &BgpPeer) -> PeerConfig {
         password: None,
         port: None,
         multihop_ttl: None,
+        graceful_restart,
     }
 }
 
@@ -53,6 +54,8 @@ pub struct RoutesControllerConfig {
     pub enable_ibgp: bool,
     /// `--routes-sync-period`.
     pub sync_period: Duration,
+    /// MP-BGP Graceful Restart applied to all peers, when enabled.
+    pub graceful_restart: Option<GracefulRestart>,
 }
 
 /// The routes controller.
@@ -61,6 +64,8 @@ pub struct NetworkRoutesController<P: NodeProvider, E: BgpEngine> {
     provider: P,
     engine: E,
     current_peers: Vec<BgpPeer>,
+    external_peers: Vec<PeerConfig>,
+    external_applied: bool,
 }
 
 impl<P: NodeProvider, E: BgpEngine> NetworkRoutesController<P, E> {
@@ -71,7 +76,29 @@ impl<P: NodeProvider, E: BgpEngine> NetworkRoutesController<P, E> {
             provider,
             engine,
             current_peers: Vec::new(),
+            external_peers: Vec::new(),
+            external_applied: false,
         }
+    }
+
+    /// Configure static external BGP peers (from `--peer-router-*` / annotations).
+    /// These are added once when the controller starts; gobgp maintains the
+    /// sessions (auto-reconnect), mirroring `connectToExternalBGPPeers`.
+    pub fn with_external_peers(mut self, peers: Vec<PeerConfig>) -> Self {
+        self.external_peers = peers;
+        self
+    }
+
+    /// Add the configured external peers to the engine once (idempotent).
+    pub async fn apply_external_peers(&mut self) -> Result<usize, BgpError> {
+        if self.external_applied {
+            return Ok(0);
+        }
+        for peer in &self.external_peers {
+            self.engine.add_peer(peer).await?;
+        }
+        self.external_applied = true;
+        Ok(self.external_peers.len())
     }
 
     /// The currently-configured peers (after the last reconcile).
@@ -99,7 +126,9 @@ impl<P: NodeProvider, E: BgpEngine> NetworkRoutesController<P, E> {
     pub async fn reconcile_and_apply(&mut self) -> Result<(usize, usize), BgpError> {
         let (add, remove) = self.reconcile();
         for peer in &add {
-            self.engine.add_peer(&to_peer_config(peer)).await?;
+            self.engine
+                .add_peer(&to_peer_config(peer, self.cfg.graceful_restart))
+                .await?;
         }
         for neighbor in &remove {
             self.engine.delete_peer(*neighbor).await?;
@@ -112,6 +141,9 @@ impl<P: NodeProvider, E: BgpEngine> NetworkRoutesController<P, E> {
     where
         F: Future<Output = ()>,
     {
+        if let Err(e) = self.apply_external_peers().await {
+            tracing::warn!(error = %e, "failed to add external BGP peers");
+        }
         let mut ticker = tokio::time::interval(self.cfg.sync_period);
         tokio::pin!(stop);
         loop {
@@ -168,6 +200,7 @@ mod tests {
                 full_mesh: true,
                 enable_ibgp: true,
                 sync_period: Duration::from_secs(300),
+                graceful_restart: None,
             },
             provider,
             engine,
@@ -197,6 +230,28 @@ mod tests {
         let mut c = controller(prov, MockBgpEngine::new());
         let (added, removed) = c.reconcile_and_apply().await.unwrap();
         assert_eq!((added, removed), (1, 0));
+        assert_eq!(c.engine.added_peer_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn external_peers_added_once() {
+        let prov = StaticNodes(StdMutex::new(vec![node("a", "10.0.0.1")]));
+        let ext = PeerConfig {
+            neighbor: "192.0.2.1".parse().unwrap(),
+            peer_asn: 65001,
+            is_external: true,
+            rr_client: false,
+            rr_cluster_id: None,
+            local_address: None,
+            password: None,
+            port: None,
+            multihop_ttl: Some(2),
+            graceful_restart: None,
+        };
+        let mut c = controller(prov, MockBgpEngine::new()).with_external_peers(vec![ext]);
+        assert_eq!(c.apply_external_peers().await.unwrap(), 1);
+        // Idempotent: a second call is a no-op.
+        assert_eq!(c.apply_external_peers().await.unwrap(), 0);
         assert_eq!(c.engine.added_peer_count(), 1);
     }
 

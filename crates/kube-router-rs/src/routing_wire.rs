@@ -65,6 +65,32 @@ pub fn node_to_bgp(node: &Node, cluster_asn: u32) -> Option<NodeBgp> {
     })
 }
 
+/// Parse the local node's BGP export policy (communities + AS-path prepend) from
+/// its annotations, for VIP/route advertisement.
+pub fn local_node_bgp_policy(
+    store: &Store<Node>,
+    name: &str,
+) -> kr_routing::bgp_policy::BgpPolicyConfig {
+    let empty = std::collections::BTreeMap::new();
+    let anns = store
+        .state()
+        .iter()
+        .find(|n| n.metadata.name.as_deref() == Some(name))
+        .and_then(|n| n.metadata.annotations.clone())
+        .unwrap_or(empty);
+    kr_routing::bgp_policy::BgpPolicyConfig::from_annotations(
+        anns.get("kube-router.io/node.bgp.communities")
+            .map(String::as_str),
+        anns.get("kube-router.io/path-prepend.as")
+            .map(String::as_str),
+        anns.get("kube-router.io/path-prepend.repeat-n")
+            .map(String::as_str),
+        anns.get("kube-router.io/node.bgp.customimportreject")
+            .map(String::as_str),
+    )
+    .unwrap_or_default()
+}
+
 /// `NodeProvider` backed by the Node reflector store.
 pub struct StoreNodeProvider {
     store: Store<Node>,
@@ -84,6 +110,21 @@ impl StoreNodeProvider {
             .iter()
             .find(|n| n.metadata.name.as_deref() == Some(name))
             .and_then(|n| node_to_bgp(n, self.cluster_asn))
+    }
+
+    /// The local node's `kube-router.io/peers` YAML annotation, if set.
+    pub fn local_node_peers_annotation(&self, name: &str) -> Option<String> {
+        self.store
+            .state()
+            .iter()
+            .find(|n| n.metadata.name.as_deref() == Some(name))
+            .and_then(|n| {
+                n.metadata
+                    .annotations
+                    .as_ref()?
+                    .get("kube-router.io/peers")
+                    .cloned()
+            })
     }
 }
 
@@ -116,13 +157,56 @@ pub fn build_controller<E: kr_bgp::BgpEngine>(
             return None;
         }
     };
+    let local_ip = local.ip;
+    // Graceful Restart applied to all peers when --bgp-graceful-restart is set.
+    let graceful_restart = config
+        .bgp_graceful_restart
+        .then_some(kr_bgp::GracefulRestart {
+            restart_time_secs: config.bgp_graceful_restart_time.as_secs() as u32,
+            deferral_time_secs: config.bgp_graceful_restart_deferral_time.as_secs() as u32,
+        });
     let cfg = RoutesControllerConfig {
         local,
         full_mesh: config.nodes_full_mesh,
         enable_ibgp: config.enable_ibgp,
         sync_period: config.routes_sync_period,
+        graceful_restart,
     };
-    Some(NetworkRoutesController::new(cfg, provider, engine))
+
+    // External peers from the global --peer-router-* flags (zipped by index).
+    let ports: Vec<u16> = config
+        .peer_router_ports
+        .iter()
+        .filter_map(|p| u16::try_from(*p).ok())
+        .collect();
+    let ttl = (config.peer_router_multihop_ttl > 0).then_some(config.peer_router_multihop_ttl);
+    let mut external = match kr_routing::external_peers::zip_peers(
+        &config.peer_router_ips,
+        &config.peer_router_asns,
+        &ports,
+        &config.peer_router_passwords,
+        ttl,
+        Some(local_ip),
+        graceful_restart,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid external peer config; ignoring external peers");
+            Vec::new()
+        }
+    };
+    // Per-node `kube-router.io/peers` YAML annotation peers (merged with the
+    // global-flag peers above).
+    if let Some(yaml) = provider.local_node_peers_annotation(local_name) {
+        match kr_routing::external_peers::parse_peers_annotation(&yaml, ttl, graceful_restart) {
+            Ok(mut p) => external.append(&mut p),
+            Err(e) => {
+                tracing::warn!(error = %e, "invalid kube-router.io/peers annotation; ignoring")
+            }
+        }
+    }
+
+    Some(NetworkRoutesController::new(cfg, provider, engine).with_external_peers(external))
 }
 
 /// In-image path to the bundled gobgpd binary.

@@ -6,6 +6,9 @@
 //! pod-subnet sources whose destination is neither a pod subnet nor a node IP.
 //! IPv6 uses `inet6:`-prefixed ipset names.
 
+use std::net::IpAddr;
+
+use ipnet::IpNet;
 use kr_common::ipfamily::IpFamily;
 
 /// IPv4 pod-subnets ipset name.
@@ -21,6 +24,35 @@ fn set_names(family: IpFamily) -> (String, String) {
             format!("inet6:{NODE_IPS_V4}"),
         ),
     }
+}
+
+/// Build an `ipset restore` payload that (re)creates and populates the
+/// pod-subnets (`hash:net`) and node-IPs (`hash:ip`) sets the SNAT rule matches.
+pub fn ipset_restore_payload(
+    pod_subnets: &[IpNet],
+    node_ips: &[IpAddr],
+    family: IpFamily,
+) -> String {
+    let (subnets_set, nodes_set) = set_names(family);
+    let fam = match family {
+        IpFamily::V4 => "inet",
+        IpFamily::V6 => "inet6",
+    };
+    let want_v6 = family == IpFamily::V6;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "create {subnets_set} hash:net family {fam} -exist\nflush {subnets_set}\n"
+    ));
+    out.push_str(&format!(
+        "create {nodes_set} hash:ip family {fam} -exist\nflush {nodes_set}\n"
+    ));
+    for net in pod_subnets.iter().filter(|n| n.addr().is_ipv6() == want_v6) {
+        out.push_str(&format!("add {subnets_set} {net}\n"));
+    }
+    for ip in node_ips.iter().filter(|i| i.is_ipv6() == want_v6) {
+        out.push_str(&format!("add {nodes_set} {ip}\n"));
+    }
+    out
 }
 
 /// Build the SNAT rule arguments for the nat POSTROUTING chain.
@@ -88,5 +120,34 @@ mod tests {
         let src_pos = r.iter().position(|a| a == "src").unwrap();
         let dst_pos = r.iter().position(|a| a == "dst").unwrap();
         assert!(src_pos < dst_pos);
+    }
+
+    #[test]
+    fn ipset_payload_creates_and_populates_both_sets() {
+        let payload = ipset_restore_payload(
+            &["10.244.0.0/24".parse().unwrap()],
+            &["192.168.1.10".parse().unwrap()],
+            IpFamily::V4,
+        );
+        assert!(payload.contains("create kube-router-pod-subnets hash:net family inet"));
+        assert!(payload.contains("create kube-router-node-ips hash:ip family inet"));
+        assert!(payload.contains("add kube-router-pod-subnets 10.244.0.0/24"));
+        assert!(payload.contains("add kube-router-node-ips 192.168.1.10"));
+    }
+
+    #[test]
+    fn ipset_payload_filters_by_family() {
+        let payload = ipset_restore_payload(
+            &[
+                "10.244.0.0/24".parse().unwrap(),
+                "fd00::/64".parse().unwrap(),
+            ],
+            &[],
+            IpFamily::V6,
+        );
+        assert!(payload.contains("inet6:kube-router-pod-subnets"));
+        assert!(payload.contains("add inet6:kube-router-pod-subnets fd00::/64"));
+        // v4 subnet excluded from the v6 set.
+        assert!(!payload.contains("10.244.0.0/24"));
     }
 }
