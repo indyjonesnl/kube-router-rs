@@ -116,13 +116,37 @@ pub fn build_controller<E: kr_bgp::BgpEngine>(
             return None;
         }
     };
+    let local_ip = local.ip;
     let cfg = RoutesControllerConfig {
         local,
         full_mesh: config.nodes_full_mesh,
         enable_ibgp: config.enable_ibgp,
         sync_period: config.routes_sync_period,
     };
-    Some(NetworkRoutesController::new(cfg, provider, engine))
+
+    // External peers from the global --peer-router-* flags (zipped by index).
+    let ports: Vec<u16> = config
+        .peer_router_ports
+        .iter()
+        .filter_map(|p| u16::try_from(*p).ok())
+        .collect();
+    let ttl = (config.peer_router_multihop_ttl > 0).then_some(config.peer_router_multihop_ttl);
+    let external = match kr_routing::external_peers::zip_peers(
+        &config.peer_router_ips,
+        &config.peer_router_asns,
+        &ports,
+        &config.peer_router_passwords,
+        ttl,
+        Some(local_ip),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid external peer config; ignoring external peers");
+            Vec::new()
+        }
+    };
+
+    Some(NetworkRoutesController::new(cfg, provider, engine).with_external_peers(external))
 }
 
 /// In-image path to the bundled gobgpd binary.
