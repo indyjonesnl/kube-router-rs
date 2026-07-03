@@ -55,7 +55,7 @@ fn origin_attr() -> api::Attribute {
 /// attribute, IPv6 an MP_REACH_NLRI attribute (mirrors `crate::path::PathBuilder`).
 fn build_path(p: &Path) -> api::Path {
     let nlri = prefix_nlri(p);
-    let (afi, pattrs) = match p.afi {
+    let (afi, mut pattrs) = match p.afi {
         Afi::Ip => (
             AFI_IP,
             vec![
@@ -81,6 +81,31 @@ fn build_path(p: &Path) -> api::Path {
             ],
         ),
     };
+    // COMMUNITIES + AS_PATH prepend attributes (from node BGP policy).
+    for attr in &p.attrs {
+        match attr {
+            crate::path::Attr::Communities(comms) if !comms.is_empty() => {
+                pattrs.push(api::Attribute {
+                    attr: Some(api::attribute::Attr::Communities(
+                        api::CommunitiesAttribute {
+                            communities: comms.clone(),
+                        },
+                    )),
+                });
+            }
+            crate::path::Attr::AsPathPrepend { asn, repeat } if *repeat > 0 => {
+                pattrs.push(api::Attribute {
+                    attr: Some(api::attribute::Attr::AsPath(api::AsPathAttribute {
+                        segments: vec![api::AsSegment {
+                            r#type: api::as_segment::Type::AsSequence as i32,
+                            numbers: vec![*asn; *repeat as usize],
+                        }],
+                    })),
+                });
+            }
+            _ => {}
+        }
+    }
     api::Path {
         nlri: Some(nlri),
         pattrs,

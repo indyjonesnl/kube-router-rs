@@ -8,6 +8,7 @@
 
 pub mod advertise;
 pub mod annotations;
+pub mod bgp_policy;
 pub mod controller;
 pub mod external_peers;
 pub mod inject;

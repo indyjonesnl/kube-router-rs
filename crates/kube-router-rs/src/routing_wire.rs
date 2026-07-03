@@ -65,6 +65,32 @@ pub fn node_to_bgp(node: &Node, cluster_asn: u32) -> Option<NodeBgp> {
     })
 }
 
+/// Parse the local node's BGP export policy (communities + AS-path prepend) from
+/// its annotations, for VIP/route advertisement.
+pub fn local_node_bgp_policy(
+    store: &Store<Node>,
+    name: &str,
+) -> kr_routing::bgp_policy::BgpPolicyConfig {
+    let empty = std::collections::BTreeMap::new();
+    let anns = store
+        .state()
+        .iter()
+        .find(|n| n.metadata.name.as_deref() == Some(name))
+        .and_then(|n| n.metadata.annotations.clone())
+        .unwrap_or(empty);
+    kr_routing::bgp_policy::BgpPolicyConfig::from_annotations(
+        anns.get("kube-router.io/node.bgp.communities")
+            .map(String::as_str),
+        anns.get("kube-router.io/path-prepend.as")
+            .map(String::as_str),
+        anns.get("kube-router.io/path-prepend.repeat-n")
+            .map(String::as_str),
+        anns.get("kube-router.io/node.bgp.customimportreject")
+            .map(String::as_str),
+    )
+    .unwrap_or_default()
+}
+
 /// `NodeProvider` backed by the Node reflector store.
 pub struct StoreNodeProvider {
     store: Store<Node>,

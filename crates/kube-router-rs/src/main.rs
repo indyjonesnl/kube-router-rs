@@ -175,6 +175,9 @@ async fn run_routing(
         anyhow::anyhow!("cannot determine node name; set --hostname-override or NODE_NAME")
     })?;
 
+    // Node BGP export policy (communities + AS-path prepend) from annotations.
+    let bgp_policy = routing_wire::local_node_bgp_policy(&store, &name);
+
     // CNI plugins + conflist (so kubelet's CNI becomes ready) + IP forwarding.
     let route_provider = routing_wire::StoreNodeRouteProvider::new(store.clone());
     let local_cidrs = route_provider.local_pod_cidrs(&name);
@@ -244,6 +247,7 @@ async fn run_routing(
                     nh,
                     config.routes_sync_period,
                     config.cache_sync_timeout,
+                    (bgp_policy.communities.clone(), bgp_policy.path_prepend),
                     shutdown_rx.clone(),
                 ))),
                 _ => None,
@@ -293,6 +297,7 @@ async fn advertise_service_vips_task(
     next_hop: std::net::IpAddr,
     sync_period: std::time::Duration,
     cache_sync_timeout: std::time::Duration,
+    policy_attrs: (Vec<u32>, Option<(u32, u8)>),
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let services = kr_kube_client::spawn_reflector::<Service>(client.clone());
@@ -308,7 +313,8 @@ async fn advertise_service_vips_task(
     .await;
 
     let provider = svc_vip_wire::StoreSvcVipProvider::new(services, slices, node_name);
-    let mut advertiser = kr_routing::Advertiser::new();
+    let mut advertiser =
+        kr_routing::Advertiser::new().with_attributes(policy_attrs.0, policy_attrs.1);
     let mut ticker = tokio::time::interval(sync_period);
     loop {
         tokio::select! {

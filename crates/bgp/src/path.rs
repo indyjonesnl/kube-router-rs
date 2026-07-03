@@ -35,6 +35,15 @@ pub enum Attr {
         /// The reachable prefix.
         nlri: IpNet,
     },
+    /// COMMUNITIES (32-bit community values) added to the advertised route.
+    Communities(Vec<u32>),
+    /// AS_PATH prepend: prepend `asn` `repeat` times on the advertised route.
+    AsPathPrepend {
+        /// ASN to prepend.
+        asn: u32,
+        /// How many times to prepend.
+        repeat: u8,
+    },
 }
 
 /// A BGP path (advertisement or withdrawal).
@@ -59,6 +68,8 @@ pub struct PathBuilder {
     prefix: IpNet,
     next_hop: IpAddr,
     withdrawal: bool,
+    communities: Vec<u32>,
+    as_prepend: Option<(u32, u8)>,
 }
 
 impl PathBuilder {
@@ -68,6 +79,8 @@ impl PathBuilder {
             prefix,
             next_hop,
             withdrawal: false,
+            communities: Vec::new(),
+            as_prepend: None,
         }
     }
 
@@ -77,10 +90,24 @@ impl PathBuilder {
         self
     }
 
+    /// Attach COMMUNITIES to the advertised route.
+    pub fn communities(mut self, communities: Vec<u32>) -> Self {
+        self.communities = communities;
+        self
+    }
+
+    /// Prepend `asn` to the AS_PATH `repeat` times (no-op if `repeat` is 0).
+    pub fn as_path_prepend(mut self, asn: u32, repeat: u8) -> Self {
+        if repeat > 0 {
+            self.as_prepend = Some((asn, repeat));
+        }
+        self
+    }
+
     /// Build the path.
     pub fn build(self) -> Path {
         let family = IpFamily::of_net(&self.prefix);
-        let (afi, attrs) = match family {
+        let (afi, mut attrs) = match family {
             IpFamily::V4 => (Afi::Ip, vec![Attr::Origin(0), Attr::NextHop(self.next_hop)]),
             IpFamily::V6 => (
                 Afi::Ip6,
@@ -93,6 +120,12 @@ impl PathBuilder {
                 ],
             ),
         };
+        if !self.communities.is_empty() {
+            attrs.push(Attr::Communities(self.communities.clone()));
+        }
+        if let Some((asn, repeat)) = self.as_prepend {
+            attrs.push(Attr::AsPathPrepend { asn, repeat });
+        }
         Path {
             afi,
             safi: Safi::Unicast,
@@ -126,6 +159,27 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Attr::MpReachNlri { .. })));
         assert!(!p.withdrawal);
+    }
+
+    #[test]
+    fn communities_and_as_prepend_attached_when_set() {
+        let p = PathBuilder::new(net("10.96.0.10/32"), ip("10.0.0.2"))
+            .communities(vec![0x0001_0002])
+            .as_path_prepend(64512, 3)
+            .build();
+        assert!(p.attrs.contains(&Attr::Communities(vec![0x0001_0002])));
+        assert!(p.attrs.contains(&Attr::AsPathPrepend {
+            asn: 64512,
+            repeat: 3
+        }));
+        // repeat 0 → no prepend attr.
+        let q = PathBuilder::new(net("10.96.0.10/32"), ip("10.0.0.2"))
+            .as_path_prepend(64512, 0)
+            .build();
+        assert!(!q
+            .attrs
+            .iter()
+            .any(|a| matches!(a, Attr::AsPathPrepend { .. })));
     }
 
     #[test]
