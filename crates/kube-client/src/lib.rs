@@ -12,4 +12,4 @@ pub mod node;
 
 pub use cache::{wait_with_timeout, CacheSyncTimeout};
 pub use client::build_client;
-pub use informers::spawn_reflector;
+pub use informers::{spawn_reflector, spawn_reflector_notify};

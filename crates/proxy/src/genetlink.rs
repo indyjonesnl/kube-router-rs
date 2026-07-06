@@ -50,6 +50,9 @@ const DEST_ATTR_ADDRESS: u16 = 1;
 const DEST_ATTR_PORT: u16 = 2;
 const DEST_ATTR_FWD_METHOD: u16 = 3;
 const DEST_ATTR_WEIGHT: u16 = 4;
+const DEST_ATTR_U_THRESH: u16 = 5;
+const DEST_ATTR_L_THRESH: u16 = 6;
+const DEST_ATTR_ADDR_FAMILY: u16 = 11;
 
 // Forwarding methods + service flags.
 const FWD_MASQ: u32 = 0;
@@ -172,6 +175,13 @@ fn fwmark_service_attr(fwmark: u32, scheduler: Scheduler, persistent: Option<u32
 }
 
 /// Build the nested `IPVS_CMD_ATTR_DEST` payload for a real server.
+///
+/// The kernel parses `IPVS_CMD_NEW_DEST`/`SET_DEST` as a *full* destination entry,
+/// which requires the forward method, weight, AND both connection thresholds. If
+/// `U_THRESH`/`L_THRESH` are omitted the kernel does not program the destination
+/// (observed: the request is ACK'd but no real server is added), so a ClusterIP
+/// ends up with an IPVS service and zero backends. Send them (0 = unlimited) plus
+/// the destination address family, mirroring the moby/ipvs encoding upstream uses.
 fn dest_attr(dst: &IpvsDestination) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend(nla(DEST_ATTR_ADDRESS, &addr_bytes(dst.addr)));
@@ -179,6 +189,9 @@ fn dest_attr(dst: &IpvsDestination) -> Vec<u8> {
     let fwd = if dst.tunnel { FWD_TUNNEL } else { FWD_MASQ };
     b.extend(nla_u32(DEST_ATTR_FWD_METHOD, fwd));
     b.extend(nla_u32(DEST_ATTR_WEIGHT, dst.weight as u32));
+    b.extend(nla_u32(DEST_ATTR_U_THRESH, 0));
+    b.extend(nla_u32(DEST_ATTR_L_THRESH, 0));
+    b.extend(nla_u16(DEST_ATTR_ADDR_FAMILY, af(dst.addr)));
     nla(IPVS_CMD_ATTR_DEST, &b)
 }
 
@@ -309,9 +322,11 @@ impl Genl {
         self.request(self.family, IPVS_CMD_DEL_SERVICE, &p)
             .map(|_| ())
     }
-    /// `IPVS_CMD_NEW_DEST` under a VIP service.
+    /// `IPVS_CMD_NEW_DEST` under a VIP service. The service is identified by
+    /// af/proto/addr/port only (like the DEL path and moby/ipvs) — the kernel's
+    /// dest command wants the service identity, not the full scheduler/flags set.
     pub fn add_destination(&mut self, svc: &IpvsService, dst: &IpvsDestination) -> io::Result<()> {
-        let mut p = service_attr(svc);
+        let mut p = service_identity_attr(svc);
         p.extend(dest_attr(dst));
         self.request(self.family, IPVS_CMD_NEW_DEST, &p).map(|_| ())
     }
@@ -439,9 +454,20 @@ mod tests {
                     tunnel: false,
                 };
                 g.add_destination(&s, &d).expect("add_destination accepted");
-                // add-service + add-dest accepted by the real kernel proves the genl
-                // encoding. Delete is best-effort here (the runtime falls back to
-                // ipvsadm on any genl del error), so we don't assert its result.
+                // Acceptance (ACK) is NOT enough: the kernel ACKs a malformed
+                // NEW_DEST while silently dropping the real server. Verify the
+                // destination actually landed in the kernel IPVS table. Skip the
+                // assertion only if `ipvsadm` isn't installed in the test env.
+                match std::process::Command::new("ipvsadm").args(["-ln"]).output() {
+                    Ok(o) if o.status.success() => {
+                        let table = String::from_utf8_lossy(&o.stdout);
+                        assert!(
+                            table.contains("10.244.0.5:8080"),
+                            "destination not programmed in kernel IPVS table:\n{table}"
+                        );
+                    }
+                    _ => eprintln!("SKIP dest-persistence assert: ipvsadm unavailable"),
+                }
                 let _ = g.del_service(&s);
             });
         }
@@ -490,5 +516,51 @@ mod tests {
             tunnel: true,
         });
         assert!(tun.windows(4).any(|w| w == FWD_TUNNEL.to_ne_bytes()));
+    }
+
+    /// Walk the inner attributes of a nested `IPVS_CMD_ATTR_DEST` payload and
+    /// return the set of attribute types present.
+    fn dest_attr_types(dst: &IpvsDestination) -> Vec<u16> {
+        let outer = dest_attr(dst);
+        // Outer nla header: len(2) + type(2); inner attrs start at offset 4.
+        let inner = &outer[4..];
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i + 4 <= inner.len() {
+            let len = u16::from_ne_bytes([inner[i], inner[i + 1]]) as usize;
+            let t = u16::from_ne_bytes([inner[i + 2], inner[i + 3]]);
+            if len < 4 || i + len > inner.len() {
+                break;
+            }
+            types.push(t);
+            i += (len + 3) & !3;
+        }
+        types
+    }
+
+    #[test]
+    fn dest_attr_includes_thresholds_and_family_for_full_entry() {
+        // Regression: the kernel drops a destination whose NEW_DEST omits the
+        // U_THRESH/L_THRESH attrs (full-entry parse), leaving services backendless.
+        let types = dest_attr_types(&IpvsDestination {
+            addr: "10.244.0.5".parse().unwrap(),
+            port: 8080,
+            weight: 1,
+            tunnel: false,
+        });
+        for required in [
+            DEST_ATTR_ADDRESS,
+            DEST_ATTR_PORT,
+            DEST_ATTR_FWD_METHOD,
+            DEST_ATTR_WEIGHT,
+            DEST_ATTR_U_THRESH,
+            DEST_ATTR_L_THRESH,
+            DEST_ATTR_ADDR_FAMILY,
+        ] {
+            assert!(
+                types.contains(&required),
+                "dest_attr missing type {required}"
+            );
+        }
     }
 }

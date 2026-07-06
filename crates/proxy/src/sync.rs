@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use ipnet::IpNet;
 use kr_netlink_sys::NetlinkOps;
 use kr_observability::{Component, HealthState, ServiceMetrics, ServiceStatSample};
+use tokio::sync::Notify;
 
 use crate::dsr::{self, FwMarkRegistry};
 use crate::firewall::{self, FwIpset, FwIptables};
@@ -665,23 +666,36 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
     }
 
     /// Run the sync loop until `stop`, emitting a heartbeat per tick.
-    pub async fn run<F>(&mut self, health: Arc<Mutex<HealthState>>, stop: F)
+    ///
+    /// Reconciles on the periodic timer AND whenever `changed` is pinged (a
+    /// Service/EndpointSlice informer event). Without the change signal a newly
+    /// ready endpoint would not be programmed until the next `sync_period` tick
+    /// (default 5m) — long enough that DNS/CoreDNS never converges on cold start
+    /// and rolling deploys blackhole a service for minutes. Change wakes are
+    /// debounced to coalesce event bursts into a single reconcile.
+    pub async fn run<F>(&mut self, health: Arc<Mutex<HealthState>>, changed: Arc<Notify>, stop: F)
     where
         F: Future<Output = ()>,
     {
         let mut ticker = tokio::time::interval(self.sync_period);
         tokio::pin!(stop);
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if let Err(e) = self.reconcile().await {
-                        tracing::warn!(error = %e, "service sync failed");
-                    }
-                    if let Ok(mut h) = health.lock() {
-                        h.heartbeat(Component::NetworkServices, Instant::now());
-                    }
+            let reconcile = tokio::select! {
+                _ = ticker.tick() => true,
+                _ = changed.notified() => {
+                    // Debounce: let a burst of related events settle before syncing.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    true
                 }
                 _ = &mut stop => break,
+            };
+            if reconcile {
+                if let Err(e) = self.reconcile().await {
+                    tracing::warn!(error = %e, "service sync failed");
+                }
+                if let Ok(mut h) = health.lock() {
+                    h.heartbeat(Component::NetworkServices, Instant::now());
+                }
             }
         }
     }
