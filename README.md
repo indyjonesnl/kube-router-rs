@@ -6,6 +6,17 @@ kube-router-rs is a project that aims to rewrite kube-router in Rust.
 kube-router is a popular network plugin for Kubernetes that provides network policies, network segmentation, and more.
 This rewrite aims to leverage Rust's performance and safety features to enhance the reliability and efficiency of kube-router.
 
+## Conformance (k0s, Hydrophone)
+
+Upstream Kubernetes conformance run against a vanilla multi-node k0s cluster
+with kube-router-rs as the sole CNI + service proxy + network-policy engine.
+Each area runs as an isolated pipeline (weekly + on merge to `main`).
+
+[![Services](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-services.yml/badge.svg?branch=main)](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-services.yml)
+[![DNS](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-dns.yml/badge.svg?branch=main)](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-dns.yml)
+[![Networking](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-network.yml/badge.svg?branch=main)](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-network.yml)
+[![NetworkPolicy](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-netpol.yml/badge.svg?branch=main)](https://github.com/indyjonesnl/kube-router-rs/actions/workflows/conformance-netpol.yml)
+
 ## Project Structure
 
 - src/

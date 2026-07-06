@@ -1,0 +1,14 @@
+name: Conformance / NetworkPolicy
+on:
+  push: { branches: [main] }
+  workflow_dispatch:
+  schedule: [{ cron: '45 6 * * 1' }]
+permissions:
+  contents: read
+jobs:
+  netpol:
+    uses: ./.github/workflows/conformance.yml
+    with:
+      area: netpol
+      focus: '\[Feature:NetworkPolicy\]'
+      skip:  '\[Serial\]|\[Slow\]'

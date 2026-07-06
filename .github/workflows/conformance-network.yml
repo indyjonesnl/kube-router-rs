@@ -1,0 +1,14 @@
+name: Conformance / Networking
+on:
+  push: { branches: [main] }
+  workflow_dispatch:
+  schedule: [{ cron: '30 6 * * 1' }]
+permissions:
+  contents: read
+jobs:
+  network:
+    uses: ./.github/workflows/conformance.yml
+    with:
+      area: network
+      focus: '\[sig-network\].*(Networking|Granular|Pods should).*\[Conformance\]'
+      skip:  '\[Serial\]'

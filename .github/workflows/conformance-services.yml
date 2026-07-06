@@ -1,0 +1,14 @@
+name: Conformance / Services
+on:
+  push: { branches: [main] }
+  workflow_dispatch:
+  schedule: [{ cron: '0 6 * * 1' }]  # weekly, Mon 06:00 UTC
+permissions:
+  contents: read
+jobs:
+  services:
+    uses: ./.github/workflows/conformance.yml
+    with:
+      area: services
+      focus: '\[sig-network\].*Services.*\[Conformance\]'
+      skip:  '\[Serial\]'
