@@ -37,6 +37,14 @@ x-k0s-worker: &k0s-worker
 networks:
   k0s-net:
     driver: bridge
+    # Static subnet so the controller has a fixed IP: konnectivity-agent and
+    # kube-router-rs run in the pod/cluster and cannot resolve the docker
+    # container name `k0s-controller-1` (docker's embedded DNS is only reachable
+    # from the node netns, not pod netns), so the API/konnectivity address must
+    # be an IP, not a name.
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
 
 services:
   k0s-controller-1:
@@ -44,7 +52,8 @@ services:
     container_name: k0s-controller-1
     hostname: k0s-controller-1
     networks:
-      - k0s-net
+      k0s-net:
+        ipv4_address: 172.31.250.10
     ports:
       - 7443:6443 # publish the API to host :7443 (avoids a :6443 collision on this host)
     tmpfs:
@@ -79,7 +88,7 @@ services:
               find /run/secrets/k0sproject.io/worker-token ! -path /run/secrets/k0sproject.io/worker-token -prune -exec rm -rf {} +
               k0s token pre-shared --role worker \
                 --cert /var/lib/k0s/pki/ca.crt \
-                --url https://k0s-controller-1:6443 \
+                --url https://172.31.250.10:6443 \
                 --out /run/secrets/k0sproject.io/worker-token/
 
               mv /run/secrets/k0sproject.io/worker-token/*.yaml /var/lib/k0s/manifests/k0s-token-secrets/worker.yaml
@@ -128,8 +137,10 @@ configs:
     content: |
       spec:
         api:
-          externalAddress: k0s-controller-1
+          externalAddress: 172.31.250.10
           sans:
+            - 172.31.250.10
+            - k0s-controller-1
             - 127.0.0.1
             - localhost
         storage:
