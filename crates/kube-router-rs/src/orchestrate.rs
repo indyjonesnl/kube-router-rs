@@ -29,7 +29,16 @@ pub fn components_for(config: &KubeRouterConfig) -> Vec<(Component, Duration)> {
     let mut out = Vec::new();
     if config.run_router {
         out.push((Component::NetworkRoutes, config.routes_sync_period));
-        out.push((Component::RouteSync, config.injected_routes_sync_period));
+        // RouteSync's health WINDOW must match the cadence of the loop that actually
+        // beats it. Upstream's RouteSyncController beats every InjectedRoutesSyncPeriod,
+        // so upstream uses that period. In kube-router-rs the RouteSync heartbeat is
+        // emitted by PodNetController (main.rs), which ticks on `routes_sync_period`
+        // (the BGP route-injector that would beat at injected_routes_sync_period only
+        // runs in the gobgp path). Registering RouteSync with the smaller
+        // injected_routes_sync_period (default 60s) while it is only beaten every
+        // routes_sync_period (default 5m) left /healthz permanently 500 after ~60s →
+        // kubelet liveness SIGTERM loop. Use the period it is actually beaten on.
+        out.push((Component::RouteSync, config.routes_sync_period));
     }
     if config.run_firewall {
         out.push((Component::NetworkPolicy, config.iptables_sync_period));
@@ -123,6 +132,29 @@ mod tests {
         assert!(comps.contains(&Component::NetworkPolicy));
         assert!(comps.contains(&Component::NetworkServices));
         assert!(!comps.contains(&Component::LoadBalancer));
+    }
+
+    #[test]
+    fn routesync_window_matches_its_heartbeat_cadence() {
+        // RouteSync is beaten by PodNetController, which ticks on routes_sync_period
+        // (NOT injected_routes_sync_period). Its health window must use that same
+        // period, else /healthz goes permanently 500 after ~injected period and the
+        // kubelet liveness probe restarts the agent in a loop. Defaults differ
+        // (routes=5m, injected=60s), so this guards the regression.
+        let c = cfg(&[]);
+        let comps = components_for(&c);
+        let rs = comps
+            .iter()
+            .find(|(comp, _)| *comp == Component::RouteSync)
+            .expect("RouteSync registered when --run-router");
+        assert_eq!(
+            rs.1, c.routes_sync_period,
+            "RouteSync window must equal routes_sync_period (its beat cadence), not injected_routes_sync_period"
+        );
+        assert_ne!(
+            c.routes_sync_period, c.injected_routes_sync_period,
+            "test is only meaningful while the two periods differ by default"
+        );
     }
 
     #[test]
