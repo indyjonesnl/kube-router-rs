@@ -410,6 +410,27 @@ pub fn setup_cni(
             tracing::warn!(error = %e, "could not set net.ipv6.conf.all.forwarding");
         }
     }
+
+    // Route bridged (intra-node, same-subnet) pod↔pod frames through netfilter so
+    // the IPVS service proxy datapath works. Without this, a pod→ClusterIP reply
+    // from an on-node backend pod is L2-forwarded on kube-bridge and bypasses
+    // conntrack, so IPVS never reverse-DNATs it back to the VIP and the client
+    // drops the reply. Node-originated traffic is L3-routed and always transits
+    // netfilter, which is why ClusterIPs are reachable from the node but not from
+    // pods. Mirrors the Go upstream (network_routes_controller): the
+    // `net/bridge/bridge-nf-call-*` sysctls only exist once `br_netfilter` is
+    // loaded, so modprobe it first. All best-effort.
+    let _ = std::process::Command::new("modprobe")
+        .arg("br_netfilter")
+        .status();
+    if let Err(e) = kr_common::sysctl::write("net.bridge.bridge-nf-call-iptables", "1") {
+        tracing::warn!(error = %e, "could not set net.bridge.bridge-nf-call-iptables; service proxy may not work");
+    }
+    if enable_ipv6 {
+        if let Err(e) = kr_common::sysctl::write("net.bridge.bridge-nf-call-ip6tables", "1") {
+            tracing::warn!(error = %e, "could not set net.bridge.bridge-nf-call-ip6tables; service proxy may not work");
+        }
+    }
     Ok(())
 }
 
