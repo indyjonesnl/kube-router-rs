@@ -119,6 +119,8 @@ configs:
           type: kine # SQLite-backed (kine) instead of etcd — far lower memory; fine for a single controller
         network:
           provider: custom # disable k0s's bundled (Go) kube-router; kube-router-rs is the CNI
+          kubeProxy:
+            disabled: true # kube-router-rs provides the service proxy (IPVS); avoid double-programming
           # k0s still allocates per-node podCIDRs from this range for our agent to consume.
           podCIDR: 10.244.0.0/16
           serviceCIDR: 10.96.0.0/12
