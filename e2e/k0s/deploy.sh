@@ -21,15 +21,17 @@ echo "== build deploy image =="
 docker build -f "$HERE/Dockerfile.deploy" -t "$IMAGE" "$HERE"
 
 echo "== import image into each node's containerd =="
+# Stream the image to `k0s ctr images import -` over the exec's stdin rather than
+# `docker cp`-ing a tar into the node: the copied file was not visible to k0s ctr
+# inside the worker containers (import failed "no such file"), leaving nodes CNI-less
+# and NotReady. Streaming (as integration-k0s.yml does) sidesteps the node filesystem.
 tar="$(mktemp --suffix=.tar)"
 docker save "$IMAGE" -o "$tar"
 for n in "${NODES[@]}"; do
   echo "  -> $n"
-  docker cp "$tar" "$n:/tmp/krrs.tar"
   # k0s controller has no worker containerd unless it also runs a worker; skip import errors there.
-  docker exec "$n" k0s ctr -a /run/k0s/containerd.sock images import /tmp/krrs.tar \
+  docker exec -i "$n" k0s ctr -a /run/k0s/containerd.sock images import - < "$tar" \
     || echo "     (skipped: $n has no worker containerd)"
-  docker exec "$n" rm -f /tmp/krrs.tar || true
 done
 rm -f "$tar"
 
