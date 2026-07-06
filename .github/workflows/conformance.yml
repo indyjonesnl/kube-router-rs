@@ -21,6 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # deploy.sh builds the agent from source (`cargo build --release`), and
+      # kr-bgp's build script compiles the BGP gRPC protos with protoc. Without
+      # it the build fails and the node never comes Ready. Mirrors ci.yml.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
