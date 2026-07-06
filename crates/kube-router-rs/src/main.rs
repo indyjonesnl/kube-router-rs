@@ -489,6 +489,47 @@ async fn run_firewall(
     Ok(())
 }
 
+/// Loosen strict reverse-path filtering (rp_filter 1 → 2) on `iface`, mirroring
+/// upstream: only override when currently strict (1), leaving 0 untouched to
+/// avoid breaking setups that rely on reverse routing. rp_filter=2 (loose) keeps
+/// anti-spoofing while allowing the asymmetric DNAT/DSR reply paths IPVS needs.
+fn ensure_rp_filter_loose(iface: &str) {
+    let key = format!("net.ipv4.conf.{iface}.rp_filter");
+    if kr_common::sysctl::read(&key).ok().as_deref() == Some("1") {
+        if let Err(e) = kr_common::sysctl::write(&key, "2") {
+            tracing::warn!(error = %e, iface, "could not set rp_filter=2");
+        }
+    }
+}
+
+/// Apply the IPVS + ARP sysctls the service proxy needs, plus rp_filter loosening
+/// on the proxy-relevant interfaces (`all`, `kube-bridge`, `kube-dummy-if`, and
+/// the node's primary link). Mirrors `network_services_controller` startup.
+async fn setup_ipvs_sysctls(primary_ip: Option<std::net::IpAddr>) {
+    for (key, val) in [
+        ("net.ipv4.vs.conntrack", "1"), // conntrack for masquerade-mode ClusterIP
+        ("net.ipv4.vs.expire_nodest_conn", "1"), // drop conns to removed real servers (UDP failover)
+        ("net.ipv4.vs.expire_quiescent_template", "1"), // expire persistence to down reals
+        ("net.ipv4.vs.conn_reuse_mode", "0"),    // avoid k8s IPVS conn-reuse drops/latency
+        ("net.ipv4.conf.all.arp_ignore", "1"),   // don't answer ARP for VIPs on the wrong iface
+        ("net.ipv4.conf.all.arp_announce", "2"),
+    ] {
+        if let Err(e) = kr_common::sysctl::write(key, val) {
+            tracing::warn!(error = %e, key, "could not set sysctl");
+        }
+    }
+    for iface in ["all", "kube-bridge", kr_proxy::sync::DUMMY_IF] {
+        ensure_rp_filter_loose(iface);
+    }
+    if let Some(ip) = primary_ip {
+        if ip.is_ipv4() {
+            if let Some(node_iface) = kr_proxy::local_ips::iface_for_ip(ip).await {
+                ensure_rp_filter_loose(&node_iface);
+            }
+        }
+    }
+}
+
 /// Build the client + Service/EndpointSlice informers and run the IPVS
 /// service-proxy controller until shutdown.
 async fn run_serviceproxy(
@@ -518,14 +559,16 @@ async fn run_serviceproxy(
         anyhow::anyhow!("cannot determine node name; set --hostname-override or NODE_NAME")
     })?;
 
-    // IPVS connection tracking (needed for masquerade-mode ClusterIP).
-    let _ = kr_common::sysctl::write("net.ipv4.vs.conntrack", "1");
-
     // Local pod CIDRs (for masquerade) + the node's primary IP.
     let pod_cidrs = routing_wire::StoreNodeRouteProvider::new(nodes.clone()).local_pod_cidrs(&name);
     let primary_ip = routing_wire::StoreNodeProvider::new(nodes, config.cluster_asn)
         .local_node(&name)
         .map(|n| n.ip);
+
+    // IPVS + ARP kernel tuning for the service-proxy datapath, mirroring the Go
+    // upstream (network_services_controller). IPv4-only: the ipvs-sysctl doc notes
+    // there are no IPv6 equivalents. All best-effort.
+    setup_ipvs_sysctls(primary_ip).await;
 
     // NodePort bind addresses: all local IPs under `--nodeport-bindon-all-ip`,
     // else just the primary node IP.
