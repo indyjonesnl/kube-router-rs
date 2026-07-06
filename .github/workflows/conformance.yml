@@ -1,0 +1,75 @@
+name: Conformance (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      area:   { required: true, type: string }   # e.g. "services" (artifact + display name)
+      focus:  { required: true, type: string }   # ginkgo --focus regex
+      skip:   { required: false, type: string, default: "" }  # ginkgo --skip regex
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with: { go-version: 'stable' }
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: conformance-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Bring up dockerized k0s cluster
+        run: docker compose -f e2e/k0s/compose-cluster.yaml up -d
+
+      - name: Deploy kube-router-rs + gate on Ready
+        run: ./e2e/k0s/deploy.sh "$RUNNER_TEMP/kubeconfig.yaml"
+
+      - name: Install hydrophone
+        run: go install sigs.k8s.io/hydrophone@latest
+
+      - name: Run conformance (${{ inputs.area }})
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig.yaml
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          # Pin the conformance image to the cluster's k8s version (strip the +k0s suffix).
+          ver="$(kubectl version -o json | python3 -c 'import sys,json;print(json.load(sys.stdin)["serverVersion"]["gitVersion"].split("+")[0])')"
+          echo "conformance image version: $ver"
+          args=( --focus "${{ inputs.focus }}"
+                 --conformance-image "registry.k8s.io/conformance:${ver}"
+                 --output-dir "$RUNNER_TEMP/out" )
+          if [ -n "${{ inputs.skip }}" ]; then args+=( --skip "${{ inputs.skip }}" ); fi
+          "$(go env GOPATH)/bin/hydrophone" "${args[@]}"
+
+      - name: Collect logs on failure
+        if: always()
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig.yaml
+        run: |
+          kubectl get nodes -o wide || true
+          kubectl -n kube-system get pods -o wide || true
+          kubectl -n kube-system logs ds/kube-router-rs --all-containers --tail=200 > "$RUNNER_TEMP/out/kube-router-rs.log" 2>&1 || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ inputs.area }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f e2e/k0s/compose-cluster.yaml down -v
