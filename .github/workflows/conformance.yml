@@ -71,9 +71,15 @@ jobs:
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig.yaml
         run: |
-          kubectl get nodes -o wide || true
-          kubectl -n kube-system get pods -o wide || true
-          kubectl -n kube-system logs ds/kube-router-rs --all-containers --tail=200 > "$RUNNER_TEMP/out/kube-router-rs.log" 2>&1 || true
+          # out/ may not exist yet if the deploy step failed before the run step
+          # created it — make it so the diagnostics below are actually captured.
+          mkdir -p "$RUNNER_TEMP/out"
+          kubectl get nodes -o wide | tee "$RUNNER_TEMP/out/nodes.txt" || true
+          kubectl get pods -A -o wide | tee "$RUNNER_TEMP/out/pods.txt" || true
+          kubectl -n kube-system describe pods -l k8s-app=kube-router-rs > "$RUNNER_TEMP/out/kube-router-rs-describe.txt" 2>&1 || true
+          kubectl -n kube-system logs ds/kube-router-rs --all-containers --tail=400 > "$RUNNER_TEMP/out/kube-router-rs.log" 2>&1 || true
+          kubectl -n kube-system logs ds/kube-router-rs --all-containers --previous --tail=400 > "$RUNNER_TEMP/out/kube-router-rs-previous.log" 2>&1 || true
+          kubectl -n kube-system logs deploy/coredns --tail=200 > "$RUNNER_TEMP/out/coredns.log" 2>&1 || true
 
       - name: Upload results
         if: always()
