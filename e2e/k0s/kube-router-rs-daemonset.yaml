@@ -2,10 +2,10 @@
 # for k0s's bundled (Go) kube-router. Uses the locally-imported image
 # (kube-router-rs:dev, imagePullPolicy: Never).
 #
-# Current state: only the routing controller is enabled and its data plane is not
-# yet implemented (LoggingEngine BGP, no netlink/CNI programming). The agent runs
-# (hostNetwork), connects to the API, reconciles iBGP peers, and serves health —
-# but does NOT yet network pods. Nodes stay NotReady until the data plane lands.
+# Current state: the agent runs (hostNetwork) with the router, firewall, and
+# service-proxy controllers enabled (--run-router, --run-firewall,
+# --run-service-proxy), installs the CNI plugins + conflist, and networks pods —
+# so nodes reach Ready.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

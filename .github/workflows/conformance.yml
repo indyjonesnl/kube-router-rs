@@ -10,12 +10,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: conformance-${{ inputs.area }}
+  cancel-in-progress: true
+
 jobs:
   conformance:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
 
       - uses: actions/setup-go@v5
         with: { go-version: 'stable' }
