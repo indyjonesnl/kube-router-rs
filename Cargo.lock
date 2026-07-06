@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "kr-bgp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "ipnet",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "kr-cni"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ipnet",
  "kr-common",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "kr-common"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "data-encoding",
  "ipnet",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "kr-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "humantime",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "kr-cri"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hyper-util",
  "prost",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "kr-kube-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "ipnet",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "kr-lballoc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "ipnet",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "kr-netlink-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "ipnet",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "kr-netpol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "ipnet",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "kr-observability"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "prometheus",
  "tokio",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "kr-proxy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "ipnet",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "kr-routing"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ipnet",
  "kr-bgp",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "kube-router-rs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
