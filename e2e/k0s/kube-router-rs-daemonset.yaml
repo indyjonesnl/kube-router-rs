@@ -98,6 +98,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Bootstrap: kube-router-rs IS the service proxy that programs the
+            # apiserver ClusterIP (10.96.0.1), and kube-proxy is disabled — so at
+            # startup it cannot reach the API via the default kubelet-injected
+            # KUBERNETES_SERVICE_HOST=10.96.0.1 (cache sync would time out and every
+            # controller would exit → CrashLoop). Point the in-cluster client at the
+            # real apiserver instead. This multi-node compose cluster reaches it at
+            # the controller container (externalAddress: k0s-controller-1); the
+            # apiserver cert SANs cover that name. Explicit env wins on name clash.
+            - name: KUBERNETES_SERVICE_HOST
+              value: "k0s-controller-1"
+            - name: KUBERNETES_SERVICE_PORT
+              value: "6443"
           livenessProbe:
             httpGet:
               path: /healthz
