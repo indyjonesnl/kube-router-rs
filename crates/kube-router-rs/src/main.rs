@@ -540,8 +540,13 @@ async fn run_serviceproxy(
 ) -> anyhow::Result<()> {
     let client =
         kr_kube_client::build_client(Some(&config.kubeconfig), Some(&config.master)).await?;
-    let services = kr_kube_client::spawn_reflector::<Service>(client.clone());
-    let slices = kr_kube_client::spawn_reflector::<EndpointSlice>(client.clone());
+    // Service/EndpointSlice changes ping `changed` so the proxy reconciles promptly
+    // (e.g. when a backend becomes ready) instead of waiting for the periodic tick.
+    let changed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let services =
+        kr_kube_client::spawn_reflector_notify::<Service>(client.clone(), changed.clone());
+    let slices =
+        kr_kube_client::spawn_reflector_notify::<EndpointSlice>(client.clone(), changed.clone());
     let nodes = kr_kube_client::spawn_reflector::<Node>(client);
 
     let (sv, sl, nd) = (services.clone(), slices.clone(), nodes.clone());
@@ -679,7 +684,7 @@ async fn run_serviceproxy(
             firewall_ipt,
             std::sync::Arc::new(kr_proxy::firewall::SystemFwIpset),
         );
-    sync.run(health, async move {
+    sync.run(health, changed, async move {
         loop {
             if *shutdown_rx.borrow() {
                 return;
