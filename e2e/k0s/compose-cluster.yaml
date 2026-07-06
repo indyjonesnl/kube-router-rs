@@ -54,7 +54,22 @@ services:
       - source: k0s.yaml
         target: /etc/k0s/k0s.yaml
     restart: on-failure
-    command: [k0s, controller]
+    # --enable-worker needs the same privileged worker runtime the workers use
+    # (rshared mount for kubelet, writable cgroup for the worker pre-flight,
+    # /dev/kmsg, pod logs) — otherwise k0s aborts with a cgroup/pre-flight error.
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    devices:
+      - /dev/kmsg
+    # --enable-worker: run kube-router-rs on the control-plane node too. The
+    # apiserver ClusterIP (10.96.0.1) backends to this node, so it must have BGP
+    # routes to the worker pod CIDRs to return pod→apiserver traffic; without a
+    # kube-router-rs instance here those replies are dropped (coredns/konnectivity
+    # never reach the API). The control-plane NoSchedule taint is kept — only the
+    # kube-router-rs DaemonSet (tolerations: operator Exists) lands here, not
+    # general workloads. Mirrors a real kube-router deployment (runs on all nodes).
+    command: [k0s, controller, --enable-worker]
     post_start:
       - command:
           - /bin/sh
@@ -76,6 +91,8 @@ services:
             done
     volumes:
       - /var/lib/k0s
+      - /var/log/pods
+      - /dev/kmsg:/dev/kmsg:ro
       - k0s-token-secrets:/var/lib/k0s/manifests/k0s-token-secrets
       - k0s-worker-token:/run/secrets/k0sproject.io/worker-token
 
