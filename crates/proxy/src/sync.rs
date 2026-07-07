@@ -377,9 +377,15 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
             }
         }
 
-        // Add/update desired services + destinations.
-        for (isvc, dests) in desired.values() {
-            self.ipvs.add_service(isvc).await?;
+        // Add/update desired services + destinations. A service already present
+        // but whose params changed (scheduler, or persistence when sessionAffinity
+        // is toggled) must be edited in place — `add_service` (NEW_SERVICE) is a
+        // no-op on an existing service, so the change would never take effect.
+        for (key, (isvc, dests)) in &desired {
+            match self.applied.get(key) {
+                Some((prev, _)) if prev != isvc => self.ipvs.edit_service(isvc).await?,
+                _ => self.ipvs.add_service(isvc).await?,
+            }
             for d in dests {
                 self.ipvs.add_destination(isvc, d).await?;
             }
@@ -762,6 +768,52 @@ mod tests {
             scheduler: Scheduler::Rr,
             persistent: None,
         }
+    }
+
+    #[tokio::test]
+    async fn toggling_session_affinity_updates_persistence_in_place() {
+        // Regression: switching a Service's sessionAffinity must edit the live IPVS
+        // service. Reconcile keys services by (addr,proto,port), and add_service is a
+        // no-op on an existing service, so a persistence change was never applied.
+        let mut affinity_on = svc("10.96.0.20");
+        affinity_on.session_affinity = true;
+        affinity_on.affinity_timeout = 100;
+        let prov = Static(StdMutex::new(vec![(
+            affinity_on,
+            vec![ep("10.244.0.5", true)],
+        )]));
+        let mut s = ServiceSync::new(
+            MockIpvs::new(),
+            MockNetlink::new(),
+            prov,
+            Duration::from_secs(300),
+            ValidationRanges::default(),
+        );
+        s.reconcile().await.unwrap();
+        assert_eq!(
+            s.ipvs.service(&isvc("10.96.0.20")).unwrap().persistent,
+            Some(100)
+        );
+
+        // Toggle affinity off → persistence must be removed on the live service.
+        s.provider.0.lock().unwrap()[0].0.session_affinity = false;
+        s.reconcile().await.unwrap();
+        assert_eq!(
+            s.ipvs.service(&isvc("10.96.0.20")).unwrap().persistent,
+            None
+        );
+
+        // Toggle back on with a new timeout → persistence updated (not stale).
+        {
+            let mut g = s.provider.0.lock().unwrap();
+            g[0].0.session_affinity = true;
+            g[0].0.affinity_timeout = 42;
+        }
+        s.reconcile().await.unwrap();
+        assert_eq!(
+            s.ipvs.service(&isvc("10.96.0.20")).unwrap().persistent,
+            Some(42)
+        );
     }
 
     #[tokio::test]
