@@ -82,6 +82,8 @@ pub struct IpvsError(pub String);
 pub trait IpvsOps: Send + Sync {
     /// Create or update a virtual service.
     async fn add_service(&self, svc: &IpvsService) -> Result<(), IpvsError>;
+    /// Update an existing virtual service's params (scheduler/persistence) in place.
+    async fn edit_service(&self, svc: &IpvsService) -> Result<(), IpvsError>;
     /// Delete a virtual service.
     async fn del_service(&self, svc: &IpvsService) -> Result<(), IpvsError>;
     /// Add or update a destination under a service.
@@ -286,6 +288,14 @@ pub fn add_service_args(svc: &IpvsService) -> Vec<String> {
     a
 }
 
+/// `ipvsadm` args to edit an existing virtual service in place (`-E`) — same
+/// fields as add, used to apply scheduler/persistence changes to a live service.
+pub fn edit_service_args(svc: &IpvsService) -> Vec<String> {
+    let mut a = add_service_args(svc);
+    a[0] = "-E".into();
+    a
+}
+
 /// `ipvsadm` args to delete a virtual service.
 pub fn del_service_args(svc: &IpvsService) -> Vec<String> {
     vec![
@@ -418,6 +428,12 @@ impl IpvsOps for SystemIpvs {
         }
         self.run(&add_service_args(svc)).await
     }
+    async fn edit_service(&self, svc: &IpvsService) -> Result<(), IpvsError> {
+        if self.via_genl(|g| g.set_service(svc)) {
+            return Ok(());
+        }
+        self.run(&edit_service_args(svc)).await
+    }
     async fn del_service(&self, svc: &IpvsService) -> Result<(), IpvsError> {
         if self.via_genl(|g| g.del_service(svc)) {
             return Ok(());
@@ -542,6 +558,11 @@ pub mod mock {
         pub fn service_count(&self) -> usize {
             self.services.lock().unwrap().len()
         }
+        /// The currently-programmed virtual service matching `svc`'s identity key
+        /// (reflects the latest add/edit), for asserting scheduler/persistence.
+        pub fn service(&self, svc: &IpvsService) -> Option<IpvsService> {
+            self.services.lock().unwrap().get(&k(svc.key())).cloned()
+        }
         /// Destinations for a service.
         pub fn destinations(&self, svc: &IpvsService) -> Vec<IpvsDestination> {
             self.destinations
@@ -587,6 +608,13 @@ pub mod mock {
 
     #[async_trait]
     impl IpvsOps for MockIpvs {
+        async fn edit_service(&self, svc: &IpvsService) -> Result<(), IpvsError> {
+            self.services
+                .lock()
+                .unwrap()
+                .insert(k(svc.key()), svc.clone());
+            Ok(())
+        }
         async fn add_service(&self, svc: &IpvsService) -> Result<(), IpvsError> {
             self.services
                 .lock()

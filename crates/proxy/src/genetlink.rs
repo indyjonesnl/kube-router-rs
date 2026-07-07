@@ -26,6 +26,7 @@ const NLMSG_ERROR: u16 = 0x02;
 
 // IPVS genl commands (moby/ipvs constants order).
 const IPVS_CMD_NEW_SERVICE: u8 = 1;
+const IPVS_CMD_SET_SERVICE: u8 = 2;
 const IPVS_CMD_DEL_SERVICE: u8 = 3;
 const IPVS_CMD_NEW_DEST: u8 = 5;
 const IPVS_CMD_DEL_DEST: u8 = 7;
@@ -314,6 +315,15 @@ impl Genl {
     pub fn add_service(&mut self, svc: &IpvsService) -> io::Result<()> {
         let p = service_attr(svc);
         self.request(self.family, IPVS_CMD_NEW_SERVICE, &p)
+            .map(|_| ())
+    }
+    /// `IPVS_CMD_SET_SERVICE` — update an existing service's params (scheduler,
+    /// persistence/flags, timeout) in place. Used when a Service's sessionAffinity
+    /// or scheduler changes: NEW_SERVICE on an existing service is a no-op, so the
+    /// change would otherwise never take effect.
+    pub fn set_service(&mut self, svc: &IpvsService) -> io::Result<()> {
+        let p = service_attr(svc);
+        self.request(self.family, IPVS_CMD_SET_SERVICE, &p)
             .map(|_| ())
     }
     /// `IPVS_CMD_DEL_SERVICE` (identifies the service by af/proto/addr/port).
