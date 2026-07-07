@@ -107,7 +107,7 @@ spec:
             # the controller container (externalAddress: k0s-controller-1); the
             # apiserver cert SANs cover that name. Explicit env wins on name clash.
             - name: KUBERNETES_SERVICE_HOST
-              value: "k0s-controller-1"
+              value: "172.31.250.10"
             - name: KUBERNETES_SERVICE_PORT
               value: "6443"
           livenessProbe:

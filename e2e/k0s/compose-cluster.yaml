@@ -37,6 +37,14 @@ x-k0s-worker: &k0s-worker
 networks:
   k0s-net:
     driver: bridge
+    # Static subnet so the controller has a fixed IP: konnectivity-agent and
+    # kube-router-rs run in the pod/cluster and cannot resolve the docker
+    # container name `k0s-controller-1` (docker's embedded DNS is only reachable
+    # from the node netns, not pod netns), so the API/konnectivity address must
+    # be an IP, not a name.
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
 
 services:
   k0s-controller-1:
@@ -44,7 +52,8 @@ services:
     container_name: k0s-controller-1
     hostname: k0s-controller-1
     networks:
-      - k0s-net
+      k0s-net:
+        ipv4_address: 172.31.250.10
     ports:
       - 7443:6443 # publish the API to host :7443 (avoids a :6443 collision on this host)
     tmpfs:
@@ -54,7 +63,22 @@ services:
       - source: k0s.yaml
         target: /etc/k0s/k0s.yaml
     restart: on-failure
-    command: [k0s, controller]
+    # --enable-worker needs the same privileged worker runtime the workers use
+    # (rshared mount for kubelet, writable cgroup for the worker pre-flight,
+    # /dev/kmsg, pod logs) — otherwise k0s aborts with a cgroup/pre-flight error.
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    devices:
+      - /dev/kmsg
+    # --enable-worker: run kube-router-rs on the control-plane node too. The
+    # apiserver ClusterIP (10.96.0.1) backends to this node, so it must have BGP
+    # routes to the worker pod CIDRs to return pod→apiserver traffic; without a
+    # kube-router-rs instance here those replies are dropped (coredns/konnectivity
+    # never reach the API). The control-plane NoSchedule taint is kept — only the
+    # kube-router-rs DaemonSet (tolerations: operator Exists) lands here, not
+    # general workloads. Mirrors a real kube-router deployment (runs on all nodes).
+    command: [k0s, controller, --enable-worker]
     post_start:
       - command:
           - /bin/sh
@@ -64,7 +88,7 @@ services:
               find /run/secrets/k0sproject.io/worker-token ! -path /run/secrets/k0sproject.io/worker-token -prune -exec rm -rf {} +
               k0s token pre-shared --role worker \
                 --cert /var/lib/k0s/pki/ca.crt \
-                --url https://k0s-controller-1:6443 \
+                --url https://172.31.250.10:6443 \
                 --out /run/secrets/k0sproject.io/worker-token/
 
               mv /run/secrets/k0sproject.io/worker-token/*.yaml /var/lib/k0s/manifests/k0s-token-secrets/worker.yaml
@@ -76,6 +100,8 @@ services:
             done
     volumes:
       - /var/lib/k0s
+      - /var/log/pods
+      - /dev/kmsg:/dev/kmsg:ro
       - k0s-token-secrets:/var/lib/k0s/manifests/k0s-token-secrets
       - k0s-worker-token:/run/secrets/k0sproject.io/worker-token
 
@@ -111,8 +137,10 @@ configs:
     content: |
       spec:
         api:
-          externalAddress: k0s-controller-1
+          externalAddress: 172.31.250.10
           sans:
+            - 172.31.250.10
+            - k0s-controller-1
             - 127.0.0.1
             - localhost
         storage:
