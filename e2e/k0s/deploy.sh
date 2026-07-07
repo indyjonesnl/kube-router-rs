@@ -42,6 +42,28 @@ export KUBECONFIG="$KUBECONFIG_OUT"
 echo "== apply daemonset =="
 kubectl apply -f "$HERE/kube-router-rs-daemonset.yaml"
 
+# Tune CoreDNS for the dockerized test cluster (two independent fixes):
+#  1. forward: k0s defaults to `forward . /etc/resolv.conf`, whose upstream in
+#     this compose env is unreachable from a pod netns. That injects latency and
+#     failures into every external/uncached lookup, which flakes name-based
+#     service reachability (e.g. the NodePort tests' `nc <svc>`). Point it at
+#     public resolvers, as the smoke deploy does.
+#  2. cache: default `cache 30` lets a replica serve a stale A record for up to
+#     30s after a Service flips ClusterIP->ExternalName (IPVS round-robins onto
+#     it), timing out the "change type to ExternalName" tests. Lower to 1s so the
+#     (correct) transition propagates within the test window.
+# Both are test-cluster DNS tuning; neither changes kube-router-rs behavior.
+core="$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)"
+if [ -n "$core" ]; then
+  newcore="$(printf '%s' "$core" \
+    | sed 's#forward \. /etc/resolv.conf#forward . 8.8.8.8 1.1.1.1#' \
+    | sed 's/cache 30/cache 1/')"
+  kubectl -n kube-system patch cm coredns --type merge \
+    -p "$(python3 -c 'import json,sys;print(json.dumps({"data":{"Corefile":sys.stdin.read()}}))' <<<"$newcore")" >/dev/null 2>&1 \
+    && kubectl -n kube-system rollout restart deploy/coredns >/dev/null 2>&1 \
+    && echo "tuned CoreDNS (forward -> 8.8.8.8/1.1.1.1, cache -> 1s)"
+fi
+
 echo "== gate: wait for nodes Ready + CoreDNS Available =="
 # All schedulable nodes must reach Ready (kube-router-rs is the CNI that flips them).
 deadline=$(( $(date +%s) + 600 ))
