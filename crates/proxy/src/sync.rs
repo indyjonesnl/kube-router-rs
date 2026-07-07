@@ -264,7 +264,22 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
 
     /// One full sync: program IPVS services/destinations for ClusterIPs and bind
     /// VIPs to the dummy interface; remove anything no longer desired.
+    ///
+    /// Full resync (`full_resync = true`) reprograms every desired service and
+    /// destination unconditionally, which self-heals any kernel state that drifted
+    /// away from what we last applied. Used by the periodic tick.
     pub async fn reconcile(&mut self) -> Result<(), SyncError> {
+        self.reconcile_inner(true).await
+    }
+
+    /// Event-driven reconcile: only program services/destinations whose desired
+    /// state differs from what we last applied. Each IPVS write opens a fresh
+    /// genetlink socket and resolves the family (a netlink round-trip), so a full
+    /// reprogram on every watch event pins a runtime worker thread and starves the
+    /// `/healthz` server, tripping the liveness probe under Service/Endpoint churn.
+    /// Diffing keeps a no-op reconcile at ~zero netlink writes (mirrors upstream,
+    /// which diffs desired state against the live kernel IPVS table each sync).
+    async fn reconcile_inner(&mut self, full_resync: bool) -> Result<(), SyncError> {
         self.nl.ensure_dummy_link(DUMMY_IF).await?;
 
         let mut desired: BTreeMap<String, (IpvsService, Vec<IpvsDestination>)> = BTreeMap::new();
@@ -382,12 +397,34 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
         // is toggled) must be edited in place — `add_service` (NEW_SERVICE) is a
         // no-op on an existing service, so the change would never take effect.
         for (key, (isvc, dests)) in &desired {
-            match self.applied.get(key) {
-                Some((prev, _)) if prev != isvc => self.ipvs.edit_service(isvc).await?,
-                _ => self.ipvs.add_service(isvc).await?,
+            let prev = self.applied.get(key);
+            match prev {
+                Some((p, _)) if p != isvc => self.ipvs.edit_service(isvc).await?,
+                // On a full resync re-issue NEW_SERVICE (idempotent) to self-heal a
+                // service the kernel may have lost; on an event-driven pass an
+                // unchanged service needs no write.
+                Some(_) if full_resync => self.ipvs.add_service(isvc).await?,
+                Some(_) => {}
+                None => self.ipvs.add_service(isvc).await?,
             }
+            let prev_dests: &[IpvsDestination] = prev.map(|(_, d)| d.as_slice()).unwrap_or(&[]);
             for d in dests {
-                self.ipvs.add_destination(isvc, d).await?;
+                if full_resync {
+                    self.ipvs.add_destination(isvc, d).await?;
+                    continue;
+                }
+                match prev_dests
+                    .iter()
+                    .find(|o| o.addr == d.addr && o.port == d.port)
+                {
+                    // Same backend, identical params (weight/tunnel): nothing to do.
+                    Some(o) if o == d => {}
+                    // Same backend, changed params: SET_DEST (add is idempotent and
+                    // would not update the weight).
+                    Some(_) => self.ipvs.update_destination(isvc, d).await?,
+                    // New backend.
+                    None => self.ipvs.add_destination(isvc, d).await?,
+                }
             }
         }
         // Collect destinations that lost their endpoint and services no longer
@@ -686,22 +723,26 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
         let mut ticker = tokio::time::interval(self.sync_period);
         tokio::pin!(stop);
         loop {
-            let reconcile = tokio::select! {
-                _ = ticker.tick() => true,
+            // Periodic ticks do a full resync (self-heal kernel drift); watch-event
+            // wakeups only program the diff, so churn can't pin a worker thread on
+            // genetlink writes and starve the liveness probe.
+            let full_resync = tokio::select! {
+                _ = ticker.tick() => Some(true),
                 _ = changed.notified() => {
                     // Debounce: let a burst of related events settle before syncing.
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    true
+                    Some(false)
                 }
-                _ = &mut stop => break,
+                _ = &mut stop => None,
             };
-            if reconcile {
-                if let Err(e) = self.reconcile().await {
-                    tracing::warn!(error = %e, "service sync failed");
-                }
-                if let Ok(mut h) = health.lock() {
-                    h.heartbeat(Component::NetworkServices, Instant::now());
-                }
+            let Some(full_resync) = full_resync else {
+                break;
+            };
+            if let Err(e) = self.reconcile_inner(full_resync).await {
+                tracing::warn!(error = %e, "service sync failed");
+            }
+            if let Ok(mut h) = health.lock() {
+                h.heartbeat(Component::NetworkServices, Instant::now());
             }
         }
     }
@@ -814,6 +855,58 @@ mod tests {
             s.ipvs.service(&isvc("10.96.0.20")).unwrap().persistent,
             Some(42)
         );
+    }
+
+    #[tokio::test]
+    async fn event_reconcile_only_programs_destination_diff() {
+        // Regression: an event-driven reconcile must program only the destination
+        // diff. A full reprogram on every watch event (each IPVS write opens a fresh
+        // genetlink socket) pins a runtime worker and starves /healthz, tripping the
+        // liveness probe under Service/Endpoint churn (crash-loop observed in the
+        // conformance harness). See reconcile_inner.
+        let prov = Static(StdMutex::new(vec![(
+            svc("10.96.0.30"),
+            vec![ep("10.244.0.5", true), ep("10.244.1.5", true)],
+        )]));
+        let mut s = ServiceSync::new(
+            MockIpvs::new(),
+            MockNetlink::new(),
+            prov,
+            Duration::from_secs(300),
+            ValidationRanges::default(),
+        );
+
+        // Initial full resync programs both destinations.
+        s.reconcile_inner(true).await.unwrap();
+        assert_eq!(s.ipvs.destinations(&isvc("10.96.0.30")).len(), 2);
+        let after_initial = s.ipvs.dest_writes();
+        assert_eq!(after_initial, 2);
+
+        // No-op event reconcile: desired == applied → zero destination writes.
+        s.reconcile_inner(false).await.unwrap();
+        assert_eq!(
+            s.ipvs.dest_writes(),
+            after_initial,
+            "no-op wrote destinations"
+        );
+
+        // Add a ready endpoint: only the new destination is written.
+        s.provider.0.lock().unwrap()[0]
+            .1
+            .push(ep("10.244.2.5", true));
+        s.reconcile_inner(false).await.unwrap();
+        assert_eq!(s.ipvs.dest_writes(), after_initial + 1);
+        assert_eq!(s.ipvs.destinations(&isvc("10.96.0.30")).len(), 3);
+
+        // Remove an endpoint: pruned via del_destination, still no add/update writes.
+        s.provider.0.lock().unwrap()[0].1.pop();
+        s.reconcile_inner(false).await.unwrap();
+        assert_eq!(s.ipvs.dest_writes(), after_initial + 1);
+        assert_eq!(s.ipvs.destinations(&isvc("10.96.0.30")).len(), 2);
+
+        // Full resync still reprograms everything (self-heal): +2 writes.
+        s.reconcile_inner(true).await.unwrap();
+        assert_eq!(s.ipvs.dest_writes(), after_initial + 3);
     }
 
     #[tokio::test]

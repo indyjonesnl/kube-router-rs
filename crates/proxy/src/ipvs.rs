@@ -525,6 +525,7 @@ pub mod mock {
     //! In-memory [`IpvsOps`] for unit tests.
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     type Key = (IpAddr, Protocol, u16);
@@ -539,6 +540,9 @@ pub mod mock {
         service_stats: Mutex<BTreeMap<String, ServiceStats>>,
         fwmark_services: Mutex<Vec<u32>>,
         fwmark_dests: Mutex<Vec<(u32, IpvsDestination)>>,
+        /// Count of destination programming calls (add + update), so tests can
+        /// assert an event-driven reconcile only writes the diff.
+        dest_writes: AtomicUsize,
     }
 
     fn k(key: Key) -> String {
@@ -553,6 +557,10 @@ pub mod mock {
         /// New empty mock.
         pub fn new() -> Self {
             Self::default()
+        }
+        /// Total destination programming calls (add + update) since creation.
+        pub fn dest_writes(&self) -> usize {
+            self.dest_writes.load(Ordering::Relaxed)
         }
         /// Number of virtual services.
         pub fn service_count(&self) -> usize {
@@ -632,6 +640,7 @@ pub mod mock {
             svc: &IpvsService,
             dst: &IpvsDestination,
         ) -> Result<(), IpvsError> {
+            self.dest_writes.fetch_add(1, Ordering::Relaxed);
             let mut d = self.destinations.lock().unwrap();
             let v = d.entry(k(svc.key())).or_default();
             v.retain(|e| !(e.addr == dst.addr && e.port == dst.port));
