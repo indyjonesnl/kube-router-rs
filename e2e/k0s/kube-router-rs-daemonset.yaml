@@ -110,12 +110,27 @@ spec:
               value: "172.31.250.10"
             - name: KUBERNETES_SERVICE_PORT
               value: "6443"
+          # Startup is CPU-heavy: the first full IPVS program, BGP convergence, and
+          # informer LISTs all land at once and can transiently saturate the tokio
+          # runtime, so a 1s (default) liveness timeout would trip and kill the pod
+          # mid-init (observed ~2-7 restarts/run under conformance churn). A
+          # startupProbe suppresses liveness until the agent is up, and liveness then
+          # runs with generous timeout/threshold so a busy-but-healthy reconcile can't
+          # cause a spurious restart.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 20244
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60  # up to ~5m to become healthy
           livenessProbe:
             httpGet:
               path: /healthz
               port: 20244
-            initialDelaySeconds: 10
             periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
           securityContext:
             privileged: true
           volumeMounts:
