@@ -42,6 +42,22 @@ export KUBECONFIG="$KUBECONFIG_OUT"
 echo "== apply daemonset =="
 kubectl apply -f "$HERE/kube-router-rs-daemonset.yaml"
 
+# Lower CoreDNS's response cache (default 30s) for the test cluster. The
+# sig-network "change type to ExternalName" conformance tests flip a Service
+# ClusterIP->ExternalName and then poll DNS; with cache 30 a replica that cached
+# the pre-change A record (from the test's connectivity check) serves it stale
+# for up to 30s, and IPVS round-robins onto it, so the poll intermittently gets
+# the old ClusterIP and times out. The transition itself is correct (verified:
+# after the cache clears, resolution is consistently the ExternalName CNAME) —
+# this only speeds propagation to within the test's window. Best-effort.
+kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null | grep -q 'cache 30' && {
+  newcore="$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' | sed 's/cache 30/cache 1/')"
+  kubectl -n kube-system patch cm coredns --type merge \
+    -p "$(python3 -c 'import json,sys;print(json.dumps({"data":{"Corefile":sys.stdin.read()}}))' <<<"$newcore")" >/dev/null 2>&1 \
+    && kubectl -n kube-system rollout restart deploy/coredns >/dev/null 2>&1 \
+    && echo "lowered CoreDNS cache 30 -> 1 (ExternalName test propagation)"
+}
+
 echo "== gate: wait for nodes Ready + CoreDNS Available =="
 # All schedulable nodes must reach Ready (kube-router-rs is the CNI that flips them).
 deadline=$(( $(date +%s) + 600 ))
