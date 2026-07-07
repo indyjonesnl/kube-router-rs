@@ -1,0 +1,33 @@
+# Runtime image for the kind e2e cluster.
+#
+# Unlike the k0s CI image, this builds kube-router-rs inside Docker so local
+# macOS runs do not accidentally package a Darwin binary into a Linux node.
+
+FROM rust:1-bookworm AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release --workspace --locked
+
+FROM ubuntu:24.04
+ARG TARGETARCH
+ARG CNI_PLUGINS_VERSION=v1.5.1
+ARG GOBGP_VERSION=4.5.0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        iptables ipset ipvsadm iproute2 conntrack ca-certificates curl \
+    && mkdir -p /opt/cni-bundled /tmp/gobgp \
+    && curl -sSLf "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}/cni-plugins-linux-${TARGETARCH}-${CNI_PLUGINS_VERSION}.tgz" \
+        | tar -xz -C /opt/cni-bundled ./bridge ./host-local ./loopback \
+    && curl -sSLf "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${TARGETARCH}.tar.gz" \
+        | tar -xz -C /tmp/gobgp gobgp gobgpd \
+    && install -m 0755 /tmp/gobgp/gobgp /tmp/gobgp/gobgpd /usr/local/bin/ \
+    && rm -rf /tmp/gobgp \
+    && apt-get purge -y curl && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/kube-router-rs /usr/local/bin/kube-router-rs
+ENTRYPOINT ["/usr/local/bin/kube-router-rs"]

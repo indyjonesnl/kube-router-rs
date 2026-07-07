@@ -6,6 +6,10 @@ on:
       area:   { required: true, type: string }   # e.g. "services" (artifact + display name)
       focus:  { required: true, type: string }   # ginkgo --focus regex
       skip:   { required: false, type: string, default: "" }  # ginkgo --skip regex
+      clusters:
+        required: false
+        type: string
+        default: '["k0s","kind"]'
 
 permissions:
   contents: read
@@ -16,8 +20,13 @@ concurrency:
 
 jobs:
   conformance:
+    name: ${{ inputs.area }} / ${{ matrix.cluster }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        cluster: ${{ fromJSON(inputs.clusters) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,11 +51,27 @@ jobs:
             target
           key: conformance-cargo-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install kind
+        if: matrix.cluster == 'kind'
+        run: |
+          go install sigs.k8s.io/kind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Bring up dockerized k0s cluster
+        if: matrix.cluster == 'k0s'
         run: docker compose -f e2e/k0s/compose-cluster.yaml up -d
 
-      - name: Deploy kube-router-rs + gate on Ready
+      - name: Bring up kind cluster
+        if: matrix.cluster == 'kind'
+        run: kind create cluster --config e2e/kind/cluster.yaml
+
+      - name: Deploy kube-router-rs to k0s + gate on Ready
+        if: matrix.cluster == 'k0s'
         run: ./e2e/k0s/deploy.sh "$RUNNER_TEMP/kubeconfig.yaml"
+
+      - name: Deploy kube-router-rs to kind + gate on Ready
+        if: matrix.cluster == 'kind'
+        run: ./e2e/kind/deploy.sh "$RUNNER_TEMP/kubeconfig.yaml"
 
       - name: Install hydrophone
         run: go install sigs.k8s.io/hydrophone@latest
@@ -85,10 +110,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-${{ inputs.area }}
+          name: conformance-${{ inputs.area }}-${{ matrix.cluster }}
           path: ${{ runner.temp }}/out
           if-no-files-found: warn
 
-      - name: Tear down
-        if: always()
+      - name: Tear down k0s
+        if: always() && matrix.cluster == 'k0s'
         run: docker compose -f e2e/k0s/compose-cluster.yaml down -v
+
+      - name: Tear down kind
+        if: always() && matrix.cluster == 'kind'
+        run: kind delete cluster --name kube-router-rs

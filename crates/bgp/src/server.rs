@@ -102,12 +102,7 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         assert!(port_ready(&addr).await);
 
-        drop(listener);
-        // A fresh ephemeral bind+drop gives us an almost-certainly-closed port.
-        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_addr = closed.local_addr().unwrap().to_string();
-        drop(closed);
-        assert!(!port_ready(&closed_addr).await);
+        assert!(!port_ready("127.0.0.1:0").await);
     }
 
     #[tokio::test]

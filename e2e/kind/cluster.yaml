@@ -1,0 +1,18 @@
+# kind cluster for kube-router-rs CNI conformance runs.
+#
+# kube-proxy and the default CNI are disabled so kube-router-rs owns pod
+# networking, NetworkPolicy, and service routing just as it does in the k0s e2e
+# cluster.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kube-router-rs
+networking:
+  disableDefaultCNI: true
+  kubeProxyMode: none
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/12
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker
