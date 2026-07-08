@@ -43,25 +43,57 @@ echo "== apply daemonset =="
 kubectl apply -f "$HERE/kube-router-rs-daemonset.yaml"
 
 # Tune CoreDNS for the dockerized test cluster (two independent fixes):
-#  1. forward: k0s defaults to `forward . /etc/resolv.conf`, whose upstream in
-#     this compose env is unreachable from a pod netns. That injects latency and
-#     failures into every external/uncached lookup, which flakes name-based
-#     service reachability (e.g. the NodePort tests' `nc <svc>`). Point it at
-#     public resolvers, as the smoke deploy does.
+#  1. forward: DROP the external `forward . /etc/resolv.conf`. Neither the node's
+#     upstream (127.0.0.53/systemd-resolved, node-loopback → unreachable from a pod
+#     netns) NOR public resolvers (8.8.8.8/1.1.1.1, blocked in this Azure runner)
+#     are reachable, so any query CoreDNS must forward BLOCKS ~10s then errors. The
+#     DNS conformance probers do `dig +search`, so every ndots search-miss (incl.
+#     the node's inherited search domain appended to cluster.local names) hit that
+#     stall; CoreDNS backed up on dead upstreams and the multi-record tests
+#     (SRV/PTR) never finished within their poll window → timeout → the test's own
+#     namespace teardown then made the result reads fail ("get pods … NotFound").
+#     Conformance needs NO external DNS (ExternalName is a CNAME served by the
+#     kubernetes plugin, not resolved onward), so removing forward makes non-cluster
+#     names SERVFAIL instantly and the probers finish fast. Upstream kube-router
+#     ships stock CoreDNS and adds no DNS handling of its own — this is purely
+#     test-cluster hygiene.
 #  2. cache: default `cache 30` lets a replica serve a stale A record for up to
-#     30s after a Service flips ClusterIP->ExternalName (IPVS round-robins onto
-#     it), timing out the "change type to ExternalName" tests. Lower to 1s so the
-#     (correct) transition propagates within the test window.
+#     30s after a Service flips ClusterIP->ExternalName, timing out the "change type
+#     to ExternalName" tests. Lower to 1s so the transition propagates in time.
 # Both are test-cluster DNS tuning; neither changes kube-router-rs behavior.
+#  3. node search domain: the Azure CI runner's node resolv.conf carries a search
+#     domain (`*.internal.cloudapp.net`), which kubelet appends to ClusterFirst pod
+#     resolv.conf. The DNS conformance probers `dig +search`, so every cluster name
+#     is also tried as `<name>.cluster.local.<azure-domain>`. With no external
+#     resolver reachable that permutation errors (SERVFAIL), and the glibc/Go
+#     resolvers ABORT the search on SERVFAIL before trying the correct absolute
+#     name → cluster lookups fail even though kube-router-rs's datapath is fine
+#     (proven by the kind job, which has no such node domain, passing 8/8). A
+#     `template` answers the azure suffix with a clean NXDOMAIN — exactly what a
+#     real upstream would return — so the resolver skips that permutation and
+#     resolves the cluster name. (`kubernetes` stays authoritative for cluster.local
+#     / in-addr.arpa; only the leaked external suffix is caught.)
 core="$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)"
 if [ -n "$core" ]; then
   newcore="$(printf '%s' "$core" \
-    | sed 's#forward \. /etc/resolv.conf#forward . 8.8.8.8 1.1.1.1#' \
-    | sed 's/cache 30/cache 1/')"
+    | sed '\#forward \. /etc/resolv.conf#d' \
+    | sed 's/cache 30/cache 1/' \
+    | python3 -c '
+import sys
+tmpl = ("    template ANY ANY internal.cloudapp.net {\n"
+        "      rcode NXDOMAIN\n"
+        "    }\n")
+out = []
+for ln in sys.stdin:
+    out.append(ln)
+    if ln.strip() == "errors":  # insert inside the .:53 server block
+        out.append(tmpl)
+sys.stdout.write("".join(out))
+')"
   kubectl -n kube-system patch cm coredns --type merge \
     -p "$(python3 -c 'import json,sys;print(json.dumps({"data":{"Corefile":sys.stdin.read()}}))' <<<"$newcore")" >/dev/null 2>&1 \
     && kubectl -n kube-system rollout restart deploy/coredns >/dev/null 2>&1 \
-    && echo "tuned CoreDNS (forward -> 8.8.8.8/1.1.1.1, cache -> 1s)"
+    && echo "tuned CoreDNS (dropped external forward, NXDOMAIN azure search domain, cache -> 1s)"
 fi
 
 echo "== gate: wait for nodes Ready + CoreDNS Available =="
