@@ -61,15 +61,39 @@ kubectl apply -f "$HERE/kube-router-rs-daemonset.yaml"
 #     30s after a Service flips ClusterIP->ExternalName, timing out the "change type
 #     to ExternalName" tests. Lower to 1s so the transition propagates in time.
 # Both are test-cluster DNS tuning; neither changes kube-router-rs behavior.
+#  3. node search domain: the Azure CI runner's node resolv.conf carries a search
+#     domain (`*.internal.cloudapp.net`), which kubelet appends to ClusterFirst pod
+#     resolv.conf. The DNS conformance probers `dig +search`, so every cluster name
+#     is also tried as `<name>.cluster.local.<azure-domain>`. With no external
+#     resolver reachable that permutation errors (SERVFAIL), and the glibc/Go
+#     resolvers ABORT the search on SERVFAIL before trying the correct absolute
+#     name → cluster lookups fail even though kube-router-rs's datapath is fine
+#     (proven by the kind job, which has no such node domain, passing 8/8). A
+#     `template` answers the azure suffix with a clean NXDOMAIN — exactly what a
+#     real upstream would return — so the resolver skips that permutation and
+#     resolves the cluster name. (`kubernetes` stays authoritative for cluster.local
+#     / in-addr.arpa; only the leaked external suffix is caught.)
 core="$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)"
 if [ -n "$core" ]; then
   newcore="$(printf '%s' "$core" \
     | sed '\#forward \. /etc/resolv.conf#d' \
-    | sed 's/cache 30/cache 1/')"
+    | sed 's/cache 30/cache 1/' \
+    | python3 -c '
+import sys
+tmpl = ("    template ANY ANY internal.cloudapp.net {\n"
+        "      rcode NXDOMAIN\n"
+        "    }\n")
+out = []
+for ln in sys.stdin:
+    out.append(ln)
+    if ln.strip() == "errors":  # insert inside the .:53 server block
+        out.append(tmpl)
+sys.stdout.write("".join(out))
+')"
   kubectl -n kube-system patch cm coredns --type merge \
     -p "$(python3 -c 'import json,sys;print(json.dumps({"data":{"Corefile":sys.stdin.read()}}))' <<<"$newcore")" >/dev/null 2>&1 \
     && kubectl -n kube-system rollout restart deploy/coredns >/dev/null 2>&1 \
-    && echo "tuned CoreDNS (dropped external forward, cache -> 1s)"
+    && echo "tuned CoreDNS (dropped external forward, NXDOMAIN azure search domain, cache -> 1s)"
 fi
 
 echo "== gate: wait for nodes Ready + CoreDNS Available =="
