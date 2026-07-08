@@ -1,46 +1,39 @@
-name: Conformance (reusable)
+name: Conformance
+
+# Build kube-router-rs ONCE, then run every (area x cluster) conformance job off
+# the same prebuilt image. Previously each of the 4 areas x 2 clusters = 8 jobs
+# compiled from scratch; now a single `build` job produces the deploy image,
+# `docker save`s it to an artifact, and the 8 test jobs `docker load` it and skip
+# their own build (KR_SKIP_BUILD=1). Every test job waited on compilation anyway,
+# so gating them on one shared build doesn't lengthen the critical path.
 
 on:
-  workflow_call:
-    inputs:
-      area:   { required: true, type: string }   # e.g. "services" (artifact + display name)
-      focus:  { required: true, type: string }   # ginkgo --focus regex
-      skip:   { required: false, type: string, default: "" }  # ginkgo --skip regex
-      clusters:
-        required: false
-        type: string
-        default: '["k0s","kind"]'
+  push: { branches: [main] }
+  workflow_dispatch:
+  schedule: [{ cron: '0 6 * * 1' }]  # weekly, Mon 06:00 UTC
 
 permissions:
   contents: read
 
 concurrency:
-  group: conformance-${{ inputs.area }}
+  group: conformance
   cancel-in-progress: true
 
 jobs:
-  conformance:
-    name: ${{ inputs.area }} / ${{ matrix.cluster }}
+  build:
+    name: build image
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        cluster: ${{ fromJSON(inputs.clusters) }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      # deploy.sh builds the agent from source (`cargo build --release`), and
-      # kr-bgp's build script compiles the BGP gRPC protos with protoc. Without
-      # it the build fails and the node never comes Ready. Mirrors ci.yml.
+      # deploy image copies a host-built binary; kr-bgp's build script compiles
+      # the BGP gRPC protos with protoc. Mirrors ci.yml.
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
-      - uses: actions/setup-go@v5
-        with: { go-version: 'stable' }
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -50,6 +43,74 @@ jobs:
             ~/.cargo/git
             target
           key: conformance-cargo-${{ hashFiles('Cargo.lock') }}
+
+      # Reproduce the k0s deploy build (host binary -> ubuntu:24.04 image). The
+      # resulting amd64 image is functionally identical for both clusters in CI.
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage binary + gobgp for the image
+        run: |
+          install -m 0755 target/release/kube-router-rs e2e/k0s/kube-router-rs
+          ./e2e/k0s/fetch-gobgp.sh
+
+      - name: Build deploy image
+        run: docker build -f e2e/k0s/Dockerfile.deploy -t kube-router-rs:dev e2e/k0s
+
+      - name: Save image to artifact
+        run: docker save kube-router-rs:dev -o "$RUNNER_TEMP/kube-router-rs-image.tar"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kube-router-rs-image
+          path: ${{ runner.temp }}/kube-router-rs-image.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  conformance:
+    name: ${{ matrix.area.name }} / ${{ matrix.cluster }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        cluster: [k0s, kind]
+        area:
+          - name: services
+            focus: '\[sig-network\].*Services.*\[Conformance\]'
+            skip:  '\[Serial\]'
+          - name: dns
+            focus: '\[sig-network\].*DNS.*\[Conformance\]'
+            skip:  '\[Serial\]'
+          - name: network
+            focus: '\[sig-network\].*(Networking|Granular|Pods should).*\[Conformance\]'
+            skip:  '\[Serial\]'
+          - name: netpol
+            focus: '\[Feature:NetworkPolicy\]'
+            skip:  '\[Serial\]|\[Slow\]'
+    env:
+      # Deploy scripts skip their own cargo build / docker build and use the
+      # image we docker-load from the shared artifact.
+      KR_SKIP_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - uses: actions/setup-go@v5
+        with: { go-version: 'stable' }
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kube-router-rs-image
+          path: ${{ runner.temp }}
+
+      - name: Load prebuilt image
+        run: docker load -i "$RUNNER_TEMP/kube-router-rs-image.tar"
 
       - name: Install kind
         if: matrix.cluster == 'kind'
@@ -88,7 +149,7 @@ jobs:
       - name: Install hydrophone
         run: go install sigs.k8s.io/hydrophone@latest
 
-      - name: Run conformance (${{ inputs.area }})
+      - name: Run conformance (${{ matrix.area.name }})
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig.yaml
         run: |
@@ -97,10 +158,10 @@ jobs:
           # Pin the conformance image to the cluster's k8s version (strip the +k0s suffix).
           ver="$(kubectl version -o json | python3 -c 'import sys,json;print(json.load(sys.stdin)["serverVersion"]["gitVersion"].split("+")[0])')"
           echo "conformance image version: $ver"
-          args=( --focus "${{ inputs.focus }}"
+          args=( --focus "${{ matrix.area.focus }}"
                  --conformance-image "registry.k8s.io/conformance:${ver}"
                  --output-dir "$RUNNER_TEMP/out" )
-          if [ -n "${{ inputs.skip }}" ]; then args+=( --skip "${{ inputs.skip }}" ); fi
+          if [ -n "${{ matrix.area.skip }}" ]; then args+=( --skip "${{ matrix.area.skip }}" ); fi
           "$(go env GOPATH)/bin/hydrophone" "${args[@]}"
 
       - name: Collect logs on failure
@@ -133,7 +194,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-${{ inputs.area }}-${{ matrix.cluster }}
+          name: conformance-${{ matrix.area.name }}-${{ matrix.cluster }}
           path: ${{ runner.temp }}/out
           if-no-files-found: warn
 
