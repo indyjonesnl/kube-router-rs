@@ -96,12 +96,25 @@ spec:
               value: "__KIND_API_HOST__"
             - name: KUBERNETES_SERVICE_PORT
               value: "6443"
+          # Startup is CPU-heavy (first full IPVS program + BGP convergence +
+          # informer LISTs land together). A startupProbe suppresses liveness until
+          # the agent is up; liveness then runs with generous timeout/threshold so a
+          # busy-but-healthy reconcile can't cause a spurious restart. See the k0s
+          # daemonset for the full rationale.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 20244
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60  # up to ~5m to become healthy
           livenessProbe:
             httpGet:
               path: /healthz
               port: 20244
-            initialDelaySeconds: 10
             periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
           securityContext:
             privileged: true
           volumeMounts:
