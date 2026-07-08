@@ -59,7 +59,19 @@ jobs:
 
       - name: Bring up dockerized k0s cluster
         if: matrix.cluster == 'k0s'
-        run: docker compose -f e2e/k0s/compose-cluster.yaml up -d
+        run: |
+          # Same-node pod->ClusterIP->pod replies are un-DNAT'd (source restored to
+          # the service VIP) by conntrack only when bridge-nf-call-iptables=1, which
+          # requires the br_netfilter module. The stock k0s node image doesn't load
+          # it (kind's node image does), and the node containers lack the module
+          # files so kube-router-rs's in-pod modprobe can't load it either. Load it
+          # on the runner host BEFORE the node netns are created — they inherit the
+          # module's default (bridge-nf-call-iptables=1). Without this, same-node DNS
+          # replies arrive from the CoreDNS pod IP instead of the kube-dns VIP
+          # ("reply from unexpected source"), intermittently flaking name-based
+          # conformance tests whenever IPVS picks the co-located backend.
+          sudo modprobe br_netfilter
+          docker compose -f e2e/k0s/compose-cluster.yaml up -d
 
       - name: Bring up kind cluster
         if: matrix.cluster == 'kind'
@@ -105,6 +117,17 @@ jobs:
           kubectl -n kube-system logs ds/kube-router-rs --all-containers --tail=400 > "$RUNNER_TEMP/out/kube-router-rs.log" 2>&1 || true
           kubectl -n kube-system logs ds/kube-router-rs --all-containers --previous --tail=400 > "$RUNNER_TEMP/out/kube-router-rs-previous.log" 2>&1 || true
           kubectl -n kube-system logs deploy/coredns --tail=200 > "$RUNNER_TEMP/out/coredns.log" 2>&1 || true
+          # Per-node netfilter state — confirms bridge-nf-call-iptables/br_netfilter
+          # (the same-node un-DNAT prerequisite) and vs.conntrack are actually set.
+          if [ "${{ matrix.cluster }}" = "k0s" ]; then
+            for n in k0s-controller-1 k0s-worker-1 k0s-worker-2 k0s-worker-3; do
+              echo "== $n =="
+              docker exec "$n" sh -c '
+                echo -n "bridge-nf-call-iptables="; cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo MISSING
+                echo -n "br_netfilter="; (lsmod 2>/dev/null | grep -q br_netfilter && echo loaded) || echo absent
+                echo -n "vs.conntrack="; cat /proc/sys/net/ipv4/vs/conntrack 2>/dev/null || echo MISSING' 2>&1
+            done > "$RUNNER_TEMP/out/node-netfilter.txt" 2>&1 || true
+          fi
 
       - name: Upload results
         if: always()
