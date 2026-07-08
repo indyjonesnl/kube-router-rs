@@ -228,6 +228,7 @@ async fn run_routing(
                 local_ip,
                 config.injected_routes_sync_period,
                 bgp_policy.import_reject.clone(),
+                health2.clone(),
                 until_shutdown(shutdown_rx.clone()),
             ));
             // Advertise service VIPs (ClusterIP/ExternalIP/LB) to peers when any
@@ -352,10 +353,21 @@ async fn receive_side_inject<F>(
     local_ip: Option<std::net::IpAddr>,
     sync_period: std::time::Duration,
     import_reject: Vec<ipnet::IpNet>,
+    health: Arc<Mutex<HealthState>>,
     stop: F,
 ) where
     F: std::future::Future<Output = ()>,
 {
+    // In the real-BGP datapath this task IS the route syncer (podnet, the flat-L2
+    // fallback that otherwise beats RouteSync, does not run here). RouteSync is
+    // registered whenever the router is enabled, so it must be beaten from here or
+    // /healthz goes permanently 500 → kubelet liveness crash-loop. Mirrors upstream,
+    // where RouteSyncController beats every InjectedRoutesSyncPeriod.
+    let beat = |health: &Arc<Mutex<HealthState>>| {
+        if let Ok(mut h) = health.lock() {
+            h.heartbeat(kr_observability::Component::RouteSync, Instant::now());
+        }
+    };
     let mut injector = kr_routing::RouteInjector::new(
         kr_netlink_sys::SystemNetlink::new(),
         Vec::new(),
@@ -380,11 +392,13 @@ async fn receive_side_inject<F>(
                     if let Err(e) = injector.on_event(&bp).await {
                         tracing::warn!(error = %e, "BGP route inject failed");
                     }
+                    beat(&health);
                 }
                 None => break,
             },
             _ = ticker.tick() => {
                 let _ = injector.sync().await;
+                beat(&health);
             }
             _ = &mut stop => break,
         }
