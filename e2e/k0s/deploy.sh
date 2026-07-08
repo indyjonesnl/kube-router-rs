@@ -10,15 +10,21 @@ KUBECONFIG_OUT="${1:-$HOME/.kube/k0s-docker.yaml}"
 IMAGE="kube-router-rs:dev"
 NODES=(k0s-controller-1 k0s-worker-1 k0s-worker-2 k0s-worker-3)
 
-echo "== build agent binary =="
-( cd "$REPO" && cargo build --release )
-install -m 0755 "$REPO/target/release/kube-router-rs" "$HERE/kube-router-rs"
+# KR_SKIP_BUILD=1 => the image is already present in the local docker daemon
+# (e.g. `docker load`ed from a shared CI artifact); skip building it here.
+if [ -z "${KR_SKIP_BUILD:-}" ]; then
+  echo "== build agent binary =="
+  ( cd "$REPO" && cargo build --release )
+  install -m 0755 "$REPO/target/release/kube-router-rs" "$HERE/kube-router-rs"
 
-echo "== fetch gobgp =="
-"$HERE/fetch-gobgp.sh"
+  echo "== fetch gobgp =="
+  "$HERE/fetch-gobgp.sh"
 
-echo "== build deploy image =="
-docker build -f "$HERE/Dockerfile.deploy" -t "$IMAGE" "$HERE"
+  echo "== build deploy image =="
+  docker build -f "$HERE/Dockerfile.deploy" -t "$IMAGE" "$HERE"
+else
+  echo "== skip build; using pre-loaded image $IMAGE =="
+fi
 
 echo "== import image into each node's containerd =="
 # Stream the image to `k0s ctr images import -` over the exec's stdin rather than

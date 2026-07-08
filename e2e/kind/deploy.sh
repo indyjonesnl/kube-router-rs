@@ -11,18 +11,24 @@ KUBECONFIG_OUT="${1:-$HOME/.kube/kind-kube-router-rs.yaml}"
 IMAGE="${KR_IMAGE:-kube-router-rs:dev}"
 CLUSTER_NAME="${KIND_CLUSTER_NAME:-kube-router-rs}"
 
-echo "== build deploy image =="
-docker_arch="$(docker info --format '{{.Architecture}}')"
-case "$docker_arch" in
-  aarch64|arm64) target_arch=arm64 ;;
-  x86_64|amd64) target_arch=amd64 ;;
-  *) echo "unsupported Docker architecture: $docker_arch" >&2; exit 1 ;;
-esac
-docker build \
-  --build-arg "TARGETARCH=$target_arch" \
-  -f "$HERE/Dockerfile.deploy" \
-  -t "$IMAGE" \
-  "$REPO"
+# KR_SKIP_BUILD=1 => the image is already present in the local docker daemon
+# (e.g. `docker load`ed from a shared CI artifact); skip building it here.
+if [ -z "${KR_SKIP_BUILD:-}" ]; then
+  echo "== build deploy image =="
+  docker_arch="$(docker info --format '{{.Architecture}}')"
+  case "$docker_arch" in
+    aarch64|arm64) target_arch=arm64 ;;
+    x86_64|amd64) target_arch=amd64 ;;
+    *) echo "unsupported Docker architecture: $docker_arch" >&2; exit 1 ;;
+  esac
+  docker build \
+    --build-arg "TARGETARCH=$target_arch" \
+    -f "$HERE/Dockerfile.deploy" \
+    -t "$IMAGE" \
+    "$REPO"
+else
+  echo "== skip build; using pre-loaded image $IMAGE =="
+fi
 
 echo "== load image into kind =="
 kind load docker-image "$IMAGE" --name "$CLUSTER_NAME"
