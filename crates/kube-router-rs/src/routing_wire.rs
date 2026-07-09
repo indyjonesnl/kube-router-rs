@@ -406,6 +406,11 @@ pub fn setup_cni(
         tracing::warn!(error = %e, "could not set net.ipv4.ip_forward");
     }
     if enable_ipv6 {
+        // Clear a node-global IPv6 disable so the stack works, mirroring upstream
+        // NRC startup (`SetSysctl(IPv6ConfAllDisableIPv6, 0)` gated on EnableIPv6).
+        if let Err(e) = kr_common::sysctl::write("net.ipv6.conf.all.disable_ipv6", "0") {
+            tracing::warn!(error = %e, "could not set net.ipv6.conf.all.disable_ipv6");
+        }
         if let Err(e) = kr_common::sysctl::write("net.ipv6.conf.all.forwarding", "1") {
             tracing::warn!(error = %e, "could not set net.ipv6.conf.all.forwarding");
         }
