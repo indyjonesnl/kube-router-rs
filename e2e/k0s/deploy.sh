@@ -31,13 +31,29 @@ echo "== import image into each node's containerd =="
 # `docker cp`-ing a tar into the node: the copied file was not visible to k0s ctr
 # inside the worker containers (import failed "no such file"), leaving nodes CNI-less
 # and NotReady. Streaming (as integration-k0s.yml does) sidesteps the node filesystem.
+#
+# Wait for each node's embedded containerd to accept connections BEFORE importing.
+# `compose up -d` returns as soon as the containers start, but k0s takes ~tens of
+# seconds to bring up containerd inside them. Previously each CI job built the image
+# inline (minutes of `cargo build`), which incidentally gave containerd time to come
+# up; with the shared prebuilt image (KR_SKIP_BUILD=1) the import fires immediately
+# and races containerd startup → `containerd.sock: context deadline exceeded`. All
+# nodes (incl. the controller, which runs `--enable-worker`) run a worker containerd
+# and need the CNI image, so a failed import is fatal, not skippable — a swallowed
+# failure leaves the node CNI-less and NotReady until the 10-min Ready gate times out.
+wait_containerd() {
+  local n="$1" deadline=$(( $(date +%s) + 180 ))
+  until docker exec "$n" k0s ctr -a /run/k0s/containerd.sock version >/dev/null 2>&1; do
+    [ "$(date +%s)" -ge "$deadline" ] && { echo "TIMEOUT: $n containerd not ready" >&2; return 1; }
+    sleep 3
+  done
+}
 tar="$(mktemp --suffix=.tar)"
 docker save "$IMAGE" -o "$tar"
 for n in "${NODES[@]}"; do
-  echo "  -> $n"
-  # k0s controller has no worker containerd unless it also runs a worker; skip import errors there.
-  docker exec -i "$n" k0s ctr -a /run/k0s/containerd.sock images import - < "$tar" \
-    || echo "     (skipped: $n has no worker containerd)"
+  echo "  -> $n (wait for containerd)"
+  wait_containerd "$n"
+  docker exec -i "$n" k0s ctr -a /run/k0s/containerd.sock images import - < "$tar"
 done
 rm -f "$tar"
 
