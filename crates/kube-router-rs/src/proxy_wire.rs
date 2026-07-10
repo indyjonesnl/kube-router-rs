@@ -9,14 +9,16 @@ use std::net::IpAddr;
 
 use k8s_openapi::api::core::v1::Service as K8sService;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kr_proxy::model::{EndpointInfo, Protocol, Scheduler, ServiceInfo};
+use kr_proxy::model::{EndpointInfo, Protocol, SchedFlags, Scheduler, ServiceInfo};
 use kr_proxy::ServiceProvider;
 use kube::runtime::reflector::store::Store;
 
 const SCHEDULER_ANNOTATION: &str = "kube-router.io/service.scheduler";
+const SCHEDFLAGS_ANNOTATION: &str = "kube-router.io/service.schedflags";
 const DSR_ANNOTATION: &str = "kube-router.io/service.dsr";
 const LOCAL_ANNOTATION: &str = "kube-router.io/service.local";
 const HAIRPIN_ANNOTATION: &str = "kube-router.io/service.hairpin";
+const HAIRPIN_EXTERNALIPS_ANNOTATION: &str = "kube-router.io/service.hairpin.externalips";
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
 fn parse_ips(v: &[String]) -> Vec<IpAddr> {
@@ -110,8 +112,18 @@ pub fn map_services(
             .get(SCHEDULER_ANNOTATION)
             .map(|s| Scheduler::parse(s))
             .unwrap_or_default();
+        // Scheduler flags are only honored for the Maglev scheduler (upstream gates
+        // `parseSchedFlags` on `scheduler == IpvsMaglevHashing`).
+        let sched_flags = if scheduler == Scheduler::Mh {
+            ann.get(SCHEDFLAGS_ANNOTATION)
+                .map(|s| SchedFlags::parse(s))
+                .unwrap_or_default()
+        } else {
+            SchedFlags::default()
+        };
         let dsr = ann.contains_key(DSR_ANNOTATION);
         let hairpin = ann.contains_key(HAIRPIN_ANNOTATION);
+        let hairpin_external_ips = ann.contains_key(HAIRPIN_EXTERNALIPS_ANNOTATION);
         let health_check_node_port = spec
             .health_check_node_port
             .and_then(|n| u16::try_from(n).ok());
@@ -164,12 +176,14 @@ pub fn map_services(
                 external_ips: parse_ips(&spec.external_ips.clone().unwrap_or_default()),
                 load_balancer_ips: load_balancer_ips.clone(),
                 scheduler,
+                sched_flags,
                 session_affinity,
                 affinity_timeout,
                 dsr,
                 internal_traffic_local,
                 external_traffic_local,
                 hairpin,
+                hairpin_external_ips,
                 health_check_node_port,
             };
             let eps = endpoints_for(slices, &namespace, &name, &port_name, local_node);
@@ -360,5 +374,57 @@ mod tests {
         );
         let mapped = map_services(&[svc], &[], "node-a");
         assert_eq!(mapped[0].0.scheduler, Scheduler::Lc);
+    }
+
+    #[test]
+    fn hairpin_externalips_annotation_parsed() {
+        let mut svc = clusterip_service("default", "web", "10.96.0.10");
+        svc.metadata.annotations = Some(
+            [(HAIRPIN_EXTERNALIPS_ANNOTATION.to_string(), "".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(
+            map_services(&[svc], &[], "node-a")[0]
+                .0
+                .hairpin_external_ips
+        );
+        // Absent by default.
+        let plain = clusterip_service("default", "web2", "10.96.0.11");
+        assert!(
+            !map_services(&[plain], &[], "node-a")[0]
+                .0
+                .hairpin_external_ips
+        );
+    }
+
+    #[test]
+    fn schedflags_parsed_only_for_maglev() {
+        let ann = |sched: &str| {
+            let mut svc = clusterip_service("default", "web", "10.96.0.10");
+            svc.metadata.annotations = Some(
+                [
+                    (SCHEDULER_ANNOTATION.to_string(), sched.to_string()),
+                    (
+                        SCHEDFLAGS_ANNOTATION.to_string(),
+                        "flag-1,flag-2".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            map_services(&[svc], &[], "node-a")[0].0.sched_flags
+        };
+        // Maglev: flags honored.
+        assert_eq!(
+            ann("mh"),
+            SchedFlags {
+                flag1: true,
+                flag2: true,
+                flag3: false
+            }
+        );
+        // Non-Maglev scheduler: flags ignored (upstream gates on the scheduler).
+        assert_eq!(ann("rr"), SchedFlags::default());
     }
 }

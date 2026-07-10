@@ -123,7 +123,7 @@ impl NodePortHealthChecks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Protocol, Scheduler};
+    use crate::model::{Protocol, SchedFlags, Scheduler};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn svc(hcnp: Option<u16>) -> ServiceInfo {
@@ -138,12 +138,14 @@ mod tests {
             external_ips: vec![],
             load_balancer_ips: vec![],
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             session_affinity: false,
             affinity_timeout: 0,
             dsr: false,
             internal_traffic_local: false,
             external_traffic_local: true,
             hairpin: false,
+            hairpin_external_ips: false,
             health_check_node_port: hcnp,
         }
     }

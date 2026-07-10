@@ -9,7 +9,7 @@ use std::net::IpAddr;
 
 use async_trait::async_trait;
 
-use crate::model::{Protocol, Scheduler};
+use crate::model::{Protocol, SchedFlags, Scheduler};
 
 /// An IPVS virtual service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,9 @@ pub struct IpvsService {
     pub port: u16,
     /// Scheduler.
     pub scheduler: Scheduler,
+    /// Scheduler flags (Maglev only); part of the service params, so a change
+    /// triggers an in-place `edit_service` via the `PartialEq` diff in sync.
+    pub sched_flags: SchedFlags,
     /// Persistence timeout (seconds) when session affinity is enabled.
     pub persistent: Option<u32>,
 }
@@ -247,6 +250,7 @@ pub fn parse_ipvsadm_stats(stats: &str, rate: &str) -> Vec<(IpvsService, Service
                     protocol,
                     port,
                     scheduler: Scheduler::Rr,
+                    sched_flags: SchedFlags::default(),
                     persistent: None,
                 },
                 stats,
@@ -281,6 +285,20 @@ pub fn add_service_args(svc: &IpvsService) -> Vec<String> {
         "-s".into(),
         svc.scheduler.ipvs_name().into(),
     ];
+    // Scheduler flags via ipvsadm `-b`. Only SCHED1/SCHED2 have portable ipvsadm
+    // token names (sh-fallback/sh-port, shared by the sh and mh schedulers);
+    // flag-3 has no stable ipvsadm name and is carried only by the genetlink path.
+    let mut sched_names = Vec::new();
+    if svc.sched_flags.flag1 {
+        sched_names.push("sh-fallback");
+    }
+    if svc.sched_flags.flag2 {
+        sched_names.push("sh-port");
+    }
+    if !sched_names.is_empty() {
+        a.push("-b".into());
+        a.push(sched_names.join(","));
+    }
     if let Some(t) = svc.persistent {
         a.push("-p".into());
         a.push(t.to_string());
@@ -710,6 +728,7 @@ mod tests {
             protocol: Protocol::Tcp,
             port: 80,
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             persistent: None,
         }
     }
@@ -769,6 +788,26 @@ mod tests {
         let a = add_service_args(&s);
         assert_eq!(&a[0..5], &["-A", "-t", "10.96.0.10:80", "-s", "mh"]);
         assert!(a.ends_with(&["-p".to_string(), "10800".to_string()]));
+    }
+
+    #[test]
+    fn ipvsadm_add_service_args_with_sched_flags() {
+        let mut s = svc();
+        s.scheduler = Scheduler::Mh;
+        s.sched_flags = SchedFlags {
+            flag1: true,
+            flag2: true,
+            flag3: true,
+        };
+        let a = add_service_args(&s);
+        // flag-1/flag-2 map to the ipvsadm `-b sh-fallback,sh-port` token list;
+        // flag-3 has no portable ipvsadm name (genetlink path carries it).
+        let bi = a.iter().position(|x| x == "-b").expect("`-b` present");
+        assert_eq!(a[bi + 1], "sh-fallback,sh-port");
+        // No flags -> no `-b`.
+        let mut s2 = svc();
+        s2.scheduler = Scheduler::Mh;
+        assert!(!add_service_args(&s2).contains(&"-b".to_string()));
     }
 
     #[test]

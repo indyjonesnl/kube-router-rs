@@ -59,6 +59,9 @@ const DEST_ATTR_ADDR_FAMILY: u16 = 11;
 const FWD_MASQ: u32 = 0;
 const FWD_TUNNEL: u32 = 2;
 const SVC_F_PERSISTENT: u32 = 0x0001;
+const SVC_F_SCHED1: u32 = 0x0008;
+const SVC_F_SCHED2: u32 = 0x0010;
+const SVC_F_SCHED3: u32 = 0x0020;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -122,11 +125,20 @@ fn service_attr(svc: &IpvsService) -> Vec<u8> {
         SVC_ATTR_SCHED_NAME,
         &zero_terminated(svc.scheduler.ipvs_name()),
     ));
-    let flags = if svc.persistent.is_some() {
+    let mut flags = if svc.persistent.is_some() {
         SVC_F_PERSISTENT
     } else {
         0
     };
+    if svc.sched_flags.flag1 {
+        flags |= SVC_F_SCHED1;
+    }
+    if svc.sched_flags.flag2 {
+        flags |= SVC_F_SCHED2;
+    }
+    if svc.sched_flags.flag3 {
+        flags |= SVC_F_SCHED3;
+    }
     // Flags attribute is {flags u32, mask u32}.
     let mut fbuf = flags.to_ne_bytes().to_vec();
     fbuf.extend_from_slice(&0xFFFF_FFFFu32.to_ne_bytes());
@@ -375,6 +387,7 @@ impl Drop for Genl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SchedFlags;
 
     #[test]
     fn nla_is_4byte_aligned_with_len_and_type() {
@@ -393,6 +406,7 @@ mod tests {
             protocol: Protocol::Tcp,
             port: 80,
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             persistent: None,
         };
         let a = service_attr(&svc);
@@ -441,6 +455,7 @@ mod tests {
                 protocol: Protocol::Tcp,
                 port: 80,
                 scheduler: Scheduler::Rr,
+                sched_flags: SchedFlags::default(),
                 persistent: None,
             }
         }

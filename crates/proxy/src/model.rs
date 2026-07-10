@@ -65,6 +65,37 @@ impl Scheduler {
     }
 }
 
+/// IPVS scheduler flags from `kube-router.io/service.schedflags` (only honored
+/// for the Maglev scheduler, mirroring upstream `parseSchedFlags`). The three
+/// generic IPVS `IP_VS_SVC_F_SCHED{1,2,3}` bits map to `flag-1/flag-2/flag-3`
+/// (for `mh`: flag-1 = fallback, flag-2 = port hashing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SchedFlags {
+    /// `flag-1` (`IP_VS_SVC_F_SCHED1`, 0x0008).
+    pub flag1: bool,
+    /// `flag-2` (`IP_VS_SVC_F_SCHED2`, 0x0010).
+    pub flag2: bool,
+    /// `flag-3` (`IP_VS_SVC_F_SCHED3`, 0x0020).
+    pub flag3: bool,
+}
+
+impl SchedFlags {
+    /// Parse a comma-separated `flag-1,flag-2,flag-3` value; unknown tokens are
+    /// ignored (mirrors upstream `parseSchedFlags`).
+    pub fn parse(value: &str) -> Self {
+        let mut f = SchedFlags::default();
+        for tok in value.split(',') {
+            match tok.trim() {
+                "flag-1" => f.flag1 = true,
+                "flag-2" => f.flag2 = true,
+                "flag-3" => f.flag3 = true,
+                _ => {}
+            }
+        }
+        f
+    }
+}
+
 /// A projected Service port (one IPVS virtual service per VIP × port).
 #[derive(Debug, Clone)]
 pub struct ServiceInfo {
@@ -88,6 +119,8 @@ pub struct ServiceInfo {
     pub load_balancer_ips: Vec<IpAddr>,
     /// IPVS scheduler.
     pub scheduler: Scheduler,
+    /// IPVS scheduler flags (`kube-router.io/service.schedflags`, Maglev only).
+    pub sched_flags: SchedFlags,
     /// Session affinity (sticky by client IP).
     pub session_affinity: bool,
     /// Affinity timeout (seconds), when `session_affinity`.
@@ -100,6 +133,9 @@ pub struct ServiceInfo {
     pub external_traffic_local: bool,
     /// Hairpin SNAT requested (`kube-router.io/service.hairpin` or global mode).
     pub hairpin: bool,
+    /// Extend hairpin SNAT to the service's external IPs
+    /// (`kube-router.io/service.hairpin.externalips`).
+    pub hairpin_external_ips: bool,
     /// `spec.healthCheckNodePort` for `externalTrafficPolicy: Local` LB services.
     pub health_check_node_port: Option<u16>,
 }
@@ -144,6 +180,28 @@ mod tests {
     }
 
     #[test]
+    fn sched_flags_parse() {
+        assert_eq!(SchedFlags::parse(""), SchedFlags::default());
+        assert_eq!(
+            SchedFlags::parse("flag-1, flag-3"),
+            SchedFlags {
+                flag1: true,
+                flag2: false,
+                flag3: true
+            }
+        );
+        // Unknown tokens ignored.
+        assert_eq!(
+            SchedFlags::parse("bogus,flag-2"),
+            SchedFlags {
+                flag1: false,
+                flag2: true,
+                flag3: false
+            }
+        );
+    }
+
+    #[test]
     fn service_id_is_stable() {
         let svc = ServiceInfo {
             namespace: "default".into(),
@@ -156,12 +214,14 @@ mod tests {
             external_ips: vec![],
             load_balancer_ips: vec![],
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             session_affinity: false,
             affinity_timeout: 0,
             dsr: false,
             internal_traffic_local: false,
             external_traffic_local: false,
             hairpin: false,
+            hairpin_external_ips: false,
             health_check_node_port: None,
         };
         assert_eq!(svc.id(), "default/web/http");

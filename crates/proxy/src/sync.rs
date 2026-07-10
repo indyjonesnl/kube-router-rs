@@ -323,6 +323,7 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
                     protocol: svc.protocol,
                     port: svc.port,
                     scheduler: svc.scheduler,
+                    sched_flags: svc.sched_flags,
                     persistent: svc.session_affinity.then_some(svc.affinity_timeout),
                 };
                 let key = svc_key(&isvc);
@@ -397,6 +398,7 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
                             protocol: svc.protocol,
                             port: np,
                             scheduler: svc.scheduler,
+                            sched_flags: svc.sched_flags,
                             persistent: svc.session_affinity.then_some(svc.affinity_timeout),
                         };
                         let key = svc_key(&isvc);
@@ -780,7 +782,7 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
 mod tests {
     use super::*;
     use crate::ipvs::mock::MockIpvs;
-    use crate::model::{Protocol, Scheduler};
+    use crate::model::{Protocol, SchedFlags, Scheduler};
     use kr_netlink_sys::mock::MockNetlink;
     use std::sync::Mutex as StdMutex;
 
@@ -796,12 +798,14 @@ mod tests {
             external_ips: vec![],
             load_balancer_ips: vec![],
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             session_affinity: false,
             affinity_timeout: 0,
             dsr: false,
             internal_traffic_local: false,
             external_traffic_local: false,
             hairpin: false,
+            hairpin_external_ips: false,
             health_check_node_port: None,
         }
     }
@@ -852,6 +856,7 @@ mod tests {
             protocol: Protocol::Tcp,
             port: 80,
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             persistent: None,
         }
     }
@@ -1058,6 +1063,7 @@ mod tests {
             protocol: Protocol::Tcp,
             port: 30080,
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             persistent: None,
         };
         assert_eq!(s.ipvs.destinations(&np).len(), 1);

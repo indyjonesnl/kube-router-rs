@@ -70,10 +70,18 @@ pub fn hairpin_rules_for_family(
         if !(global || svc.hairpin) {
             continue;
         }
+        // ClusterIPs always get hairpin rules; external IPs only when the service
+        // opts in via `kube-router.io/service.hairpin.externalips` (mirrors upstream
+        // gating `hairpinRuleFrom(familyExternalIPs, …)` on `hairpinExternalIPs`).
+        let external = if svc.hairpin_external_ips {
+            svc.external_ips.as_slice()
+        } else {
+            &[]
+        };
         let vips: Vec<IpAddr> = svc
             .cluster_ips
             .iter()
-            .chain(svc.external_ips.iter())
+            .chain(external.iter())
             .copied()
             .filter(|v| v.is_ipv6() == ipv6)
             .collect();
@@ -258,7 +266,7 @@ pub mod mock {
 mod tests {
     use super::mock::MockNat;
     use super::*;
-    use crate::model::{Protocol, Scheduler};
+    use crate::model::{Protocol, SchedFlags, Scheduler};
 
     fn svc(vip: &str, hairpin: bool) -> ServiceInfo {
         ServiceInfo {
@@ -272,12 +280,14 @@ mod tests {
             external_ips: vec![],
             load_balancer_ips: vec![],
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             session_affinity: false,
             affinity_timeout: 0,
             dsr: false,
             internal_traffic_local: false,
             external_traffic_local: false,
             hairpin,
+            hairpin_external_ips: false,
             health_check_node_port: None,
         }
     }
@@ -332,6 +342,30 @@ mod tests {
         assert_eq!(rules.len(), 1); // only the local ready endpoint of the hairpin svc
         assert!(rules[0].contains(&"10.244.0.5/32".to_string()));
         assert!(rules[0].contains(&"10.96.0.10".to_string()));
+    }
+
+    #[test]
+    fn external_ips_hairpin_gated_on_annotation() {
+        let base = svc("10.96.0.10", true);
+        let with_ext = ServiceInfo {
+            external_ips: vec!["192.0.2.10".parse().unwrap()],
+            hairpin_external_ips: false,
+            ..base.clone()
+        };
+        let ep_local = vec![ep("10.244.0.5", true, true)];
+        // Without the annotation: only the ClusterIP gets a hairpin rule.
+        let rules = hairpin_rules_for_family(&[(with_ext, ep_local.clone())], false, false);
+        assert_eq!(rules.len(), 1);
+        assert!(rules.iter().all(|r| r.contains(&"10.96.0.10".to_string())));
+        // With the annotation: ClusterIP + external IP both get rules.
+        let opted = ServiceInfo {
+            external_ips: vec!["192.0.2.10".parse().unwrap()],
+            hairpin_external_ips: true,
+            ..base
+        };
+        let rules = hairpin_rules_for_family(&[(opted, ep_local)], false, false);
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().any(|r| r.contains(&"192.0.2.10".to_string())));
     }
 
     #[test]
