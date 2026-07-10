@@ -151,6 +151,18 @@ pub struct ServiceSync<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> {
     /// Maps an IPVS service key to its owning `(namespace, name)` for metrics.
     meta: BTreeMap<String, (String, String)>,
     bound_vips: BTreeSet<IpAddr>,
+    /// Last-applied `net.ipv4.vs.sloppy_tcp` value. Init `false` = assume the
+    /// fresh-IPVS default (0); reconcile writes only on change, so clusters with
+    /// no DSR+Maglev service (the vast majority) never touch the knob.
+    sloppy_tcp: bool,
+}
+
+/// Upstream enables `net.ipv4.vs.sloppy_tcp` iff a DSR service using the Maglev
+/// scheduler is configured (`setupSloppyTCP` in service_endpoints_sync.go): Maglev
+/// is stateless per-packet, so mid-stream TCP packets can land on this director
+/// without a conntrack entry and must be accepted "sloppily" rather than dropped.
+fn service_wants_sloppy_tcp(svc: &ServiceInfo) -> bool {
+    svc.dsr && svc.scheduler == Scheduler::Mh
 }
 
 impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
@@ -188,6 +200,7 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
             applied: BTreeMap::new(),
             meta: BTreeMap::new(),
             bound_vips: BTreeSet::new(),
+            sloppy_tcp: false,
         }
     }
 
@@ -287,7 +300,9 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
         let mut meta: BTreeMap<String, (String, String)> = BTreeMap::new();
         let mut dsr_jobs: Vec<DsrJob> = Vec::new();
         let dsr_enabled = !self.dsr_mangle.is_empty();
+        let mut want_sloppy_tcp = false;
         for (svc, eps) in self.provider.services() {
+            want_sloppy_tcp |= service_wants_sloppy_tcp(&svc);
             // DSR external/LB VIPs (when enabled) take the FWMARK path below instead
             // of a dummy-bound IPVS service.
             let mut dsr_vips: Vec<IpAddr> = Vec::new();
@@ -389,6 +404,19 @@ impl<I: IpvsOps, N: NetlinkOps, P: ServiceProvider> ServiceSync<I, N, P> {
                         desired.insert(key, (isvc, nodeport_dests.clone()));
                     }
                 }
+            }
+        }
+
+        // Toggle net.ipv4.vs.sloppy_tcp to match whether any DSR+Maglev service is
+        // configured (mirrors upstream setupSloppyTCP), writing only on change.
+        if want_sloppy_tcp != self.sloppy_tcp {
+            let val = if want_sloppy_tcp { "1" } else { "0" };
+            match kr_common::sysctl::write("net.ipv4.vs.sloppy_tcp", val) {
+                Ok(()) => {
+                    self.sloppy_tcp = want_sloppy_tcp;
+                    tracing::info!(sloppy_tcp = want_sloppy_tcp, "set net.ipv4.vs.sloppy_tcp");
+                }
+                Err(e) => tracing::warn!(error = %e, "could not set net.ipv4.vs.sloppy_tcp"),
             }
         }
 
@@ -777,6 +805,23 @@ mod tests {
             health_check_node_port: None,
         }
     }
+    #[test]
+    fn sloppy_tcp_only_for_dsr_maglev() {
+        let mut s = svc("10.0.0.1");
+        // Neither DSR nor Maglev -> no.
+        assert!(!service_wants_sloppy_tcp(&s));
+        // Maglev alone (no DSR) -> no.
+        s.scheduler = Scheduler::Mh;
+        assert!(!service_wants_sloppy_tcp(&s));
+        // DSR alone (default rr scheduler) -> no.
+        s.scheduler = Scheduler::Rr;
+        s.dsr = true;
+        assert!(!service_wants_sloppy_tcp(&s));
+        // DSR + Maglev -> yes.
+        s.scheduler = Scheduler::Mh;
+        assert!(service_wants_sloppy_tcp(&s));
+    }
+
     fn ep(ip: &str, ready: bool) -> EndpointInfo {
         EndpointInfo {
             ip: ip.parse().unwrap(),
