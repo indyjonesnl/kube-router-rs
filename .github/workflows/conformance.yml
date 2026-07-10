@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # deploy image copies a host-built binary; kr-bgp's build script compiles
       # the BGP gRPC protos with protoc. Mirrors ci.yml.
@@ -36,7 +36,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -61,7 +61,7 @@ jobs:
         run: docker save kube-router-rs:dev -o "$RUNNER_TEMP/kube-router-rs-image.tar"
 
       - name: Upload image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kube-router-rs-image
           path: ${{ runner.temp }}/kube-router-rs-image.tar
@@ -95,16 +95,16 @@ jobs:
       # image we docker-load from the shared artifact.
       KR_SKIP_BUILD: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with: { go-version: 'stable' }
 
       - name: Download image artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: kube-router-rs-image
           path: ${{ runner.temp }}
@@ -192,7 +192,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: conformance-${{ matrix.area.name }}-${{ matrix.cluster }}
           path: ${{ runner.temp }}/out

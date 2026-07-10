@@ -30,7 +30,7 @@ jobs:
     name: build + push image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The git tag and the crate version are one thing. A tag push whose name
       # doesn't match [workspace.package] version is a mistake — fail loudly rather
