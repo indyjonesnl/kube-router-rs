@@ -71,7 +71,7 @@ impl GracefulQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Protocol, Scheduler};
+    use crate::model::{Protocol, SchedFlags, Scheduler};
     use std::time::Duration;
 
     fn svc() -> IpvsService {
@@ -80,6 +80,7 @@ mod tests {
             protocol: Protocol::Tcp,
             port: 80,
             scheduler: Scheduler::Rr,
+            sched_flags: SchedFlags::default(),
             persistent: None,
         }
     }
