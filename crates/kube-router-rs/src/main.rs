@@ -532,7 +532,7 @@ async fn setup_ipvs_sysctls(primary_ip: Option<std::net::IpAddr>) {
             tracing::warn!(error = %e, key, "could not set sysctl");
         }
     }
-    for iface in ["all", "default", "kube-bridge", kr_proxy::sync::DUMMY_IF] {
+    for iface in ["all", "kube-bridge", kr_proxy::sync::DUMMY_IF] {
         ensure_rp_filter_loose(iface);
     }
     if let Some(ip) = primary_ip {
@@ -578,19 +578,11 @@ async fn run_serviceproxy(
         anyhow::anyhow!("cannot determine node name; set --hostname-override or NODE_NAME")
     })?;
 
-    let provider = proxy_wire::StoreServiceProvider::new(
-        services,
-        slices,
-        nodes.clone(),
-        name.clone(),
-        config.cluster_asn,
-        config.nodeport_bindon_all_ip,
-    );
-
-    let primary_ip = match provider.primary_ip() {
-        Some(ip) => Some(ip),
-        None => kr_proxy::local_ips::all_local_ips().await.first().copied(),
-    };
+    // Local pod CIDRs (for masquerade) + the node's primary IP.
+    let pod_cidrs = routing_wire::StoreNodeRouteProvider::new(nodes.clone()).local_pod_cidrs(&name);
+    let primary_ip = routing_wire::StoreNodeProvider::new(nodes, config.cluster_asn)
+        .local_node(&name)
+        .map(|n| n.ip);
 
     // IPVS + ARP kernel tuning for the service-proxy datapath, mirroring the Go
     // upstream (network_services_controller). IPv4-only: the ipvs-sysctl doc notes
@@ -598,18 +590,14 @@ async fn run_serviceproxy(
     setup_ipvs_sysctls(primary_ip).await;
 
     // NodePort bind addresses: all local IPs under `--nodeport-bindon-all-ip`,
-    // else just the primary node IP (falling back to all local IPs if primary is missing).
+    // else just the primary node IP.
     let node_ips: Vec<std::net::IpAddr> = if config.nodeport_bindon_all_ip {
         kr_proxy::local_ips::all_local_ips().await
     } else {
-        let mut ips: Vec<std::net::IpAddr> = primary_ip.into_iter().collect();
-        if ips.is_empty() {
-            ips = kr_proxy::local_ips::all_local_ips().await;
-        }
-        ips
+        primary_ip.into_iter().collect()
     };
 
-    let pod_cidrs = provider.pod_cidrs();
+    let provider = proxy_wire::StoreServiceProvider::new(services, slices, name);
     let parse_nets =
         |v: &[String]| -> Vec<ipnet::IpNet> { v.iter().filter_map(|s| s.parse().ok()).collect() };
     let ranges = kr_proxy::sync::ValidationRanges {
