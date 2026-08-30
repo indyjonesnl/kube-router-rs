@@ -532,7 +532,7 @@ async fn setup_ipvs_sysctls(primary_ip: Option<std::net::IpAddr>) {
             tracing::warn!(error = %e, key, "could not set sysctl");
         }
     }
-    for iface in ["all", "kube-bridge", kr_proxy::sync::DUMMY_IF] {
+    for iface in ["all", "default", "kube-bridge", kr_proxy::sync::DUMMY_IF] {
         ensure_rp_filter_loose(iface);
     }
     if let Some(ip) = primary_ip {

@@ -49,11 +49,25 @@ sed "s#__KIND_API_HOST__#${api_host}#g" "$HERE/kube-router-rs-daemonset.yaml" | 
 echo "== tune CoreDNS =="
 core="$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null || true)"
 if [ -n "$core" ]; then
-  newcore="$(printf '%s' "$core" | sed 's/cache 30/cache 1/')"
+  newcore="$(printf '%s' "$core" \
+    | sed '\#forward \. /etc/resolv.conf#d' \
+    | sed 's/cache 30/cache 1/' \
+    | python3 -c '
+import sys
+tmpl = ("    template ANY ANY internal.cloudapp.net {\n"
+        "      rcode NXDOMAIN\n"
+        "    }\n")
+out = []
+for ln in sys.stdin:
+    out.append(ln)
+    if ln.strip() == "errors":  # insert inside the .:53 server block
+        out.append(tmpl)
+sys.stdout.write("".join(out))
+')"
   kubectl -n kube-system patch cm coredns --type merge \
     -p "$(python3 -c 'import json,sys;print(json.dumps({"data":{"Corefile":sys.stdin.read()}}))' <<<"$newcore")" >/dev/null 2>&1 \
     && kubectl -n kube-system rollout restart deploy/coredns >/dev/null 2>&1 \
-    && echo "tuned CoreDNS cache -> 1s"
+    && echo "tuned CoreDNS (dropped external forward, NXDOMAIN azure search domain, cache -> 1s)"
 fi
 
 echo "== gate: wait for nodes Ready + CoreDNS Available =="
