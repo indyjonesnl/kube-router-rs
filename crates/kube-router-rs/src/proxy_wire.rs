@@ -7,7 +7,7 @@
 
 use std::net::IpAddr;
 
-use k8s_openapi::api::core::v1::{Node as K8sNode, Service as K8sService};
+use k8s_openapi::api::core::v1::Service as K8sService;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kr_proxy::model::{EndpointInfo, Protocol, SchedFlags, Scheduler, ServiceInfo};
 use kr_proxy::ServiceProvider;
@@ -53,27 +53,14 @@ fn endpoints_for(
         let ports = slice.ports.clone().unwrap_or_default();
         let port = ports
             .iter()
-            .find(|p| !port_name.is_empty() && p.name.as_deref() == Some(port_name))
-            .or_else(|| {
-                if ports.len() == 1 || port_name.is_empty() {
-                    ports.first()
-                } else {
-                    None
-                }
-            })
+            .find(|p| port_name.is_empty() || p.name.as_deref() == Some(port_name))
+            .or_else(|| ports.first())
             .and_then(|p| p.port);
         let Some(port) = port.and_then(|p| u16::try_from(p).ok()) else {
             continue;
         };
         for ep in slice.endpoints.clone().unwrap_or_default() {
-            let ready = ep
-                .conditions
-                .as_ref()
-                .map(|c| {
-                    c.ready
-                        .unwrap_or_else(|| c.serving.unwrap_or(!c.terminating.unwrap_or(false)))
-                })
-                .unwrap_or(true);
+            let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
             let is_local = ep.node_name.as_deref() == Some(local_node);
             for addr in &ep.addresses {
                 if let Ok(ip) = addr.parse::<IpAddr>() {
@@ -216,60 +203,24 @@ pub fn map_services(
     out
 }
 
-/// `ServiceProvider` backed by the Service + EndpointSlice + Node reflector stores.
+/// `ServiceProvider` backed by the Service + EndpointSlice reflector stores.
 pub struct StoreServiceProvider {
     services: Store<K8sService>,
     slices: Store<EndpointSlice>,
-    nodes: Store<K8sNode>,
     local_node: String,
-    cluster_asn: u32,
-    #[allow(dead_code)]
-    bindon_all_ip: bool,
 }
 
 impl StoreServiceProvider {
-    /// Wrap the stores + local node name + cluster config.
+    /// Wrap the stores + local node name.
     pub fn new(
         services: Store<K8sService>,
         slices: Store<EndpointSlice>,
-        nodes: Store<K8sNode>,
         local_node: String,
-        cluster_asn: u32,
-        bindon_all_ip: bool,
     ) -> Self {
         Self {
             services,
             slices,
-            nodes,
             local_node,
-            cluster_asn,
-            bindon_all_ip,
-        }
-    }
-
-    /// Primary IP of the local node from the Node store.
-    pub fn primary_ip(&self) -> Option<IpAddr> {
-        crate::routing_wire::StoreNodeProvider::new(self.nodes.clone(), self.cluster_asn)
-            .local_node(&self.local_node)
-            .map(|n| n.ip)
-    }
-
-    /// Pod CIDRs of the local node from the Node store.
-    pub fn pod_cidrs(&self) -> Vec<String> {
-        crate::routing_wire::StoreNodeRouteProvider::new(self.nodes.clone())
-            .local_pod_cidrs(&self.local_node)
-            .iter()
-            .map(|c| c.to_string())
-            .collect()
-    }
-
-    /// NodePort bind addresses.
-    #[allow(dead_code)]
-    pub fn node_ips(&self) -> Vec<IpAddr> {
-        if self.bindon_all_ip {
-            Vec::new()
-        } else {
-            self.primary_ip().into_iter().collect()
         }
     }
 }
