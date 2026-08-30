@@ -65,11 +65,21 @@ pub fn map_svc_vips(
         let parse = |v: &[String]| -> Vec<std::net::IpAddr> {
             v.iter().filter_map(|s| s.parse().ok()).collect()
         };
-        let mut cluster = spec
-            .cluster_ips
-            .clone()
-            .unwrap_or_else(|| spec.cluster_ip.clone().into_iter().collect());
-        cluster.retain(|ip| ip != "None" && !ip.is_empty());
+        let mut raw_cluster = Vec::new();
+        if let Some(ref ips) = spec.cluster_ips {
+            for ip in ips {
+                if ip != "None" && !ip.is_empty() {
+                    raw_cluster.push(ip.clone());
+                }
+            }
+        }
+        if raw_cluster.is_empty() {
+            if let Some(ref ip) = spec.cluster_ip {
+                if ip != "None" && !ip.is_empty() {
+                    raw_cluster.push(ip.clone());
+                }
+            }
+        }
         let lb_ips = svc
             .status
             .as_ref()
@@ -87,7 +97,7 @@ pub fn map_svc_vips(
         let local_ann = anns.get(LOCAL_ANN).map(String::as_str) == Some("true");
 
         out.push(SvcVip {
-            cluster_ips: parse(&cluster),
+            cluster_ips: parse(&raw_cluster),
             external_ips: parse(&spec.external_ips.clone().unwrap_or_default()),
             lb_ips,
             internal_traffic_local: spec.internal_traffic_policy.as_deref() == Some("Local"),

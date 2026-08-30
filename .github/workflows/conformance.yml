@@ -136,7 +136,9 @@ jobs:
 
       - name: Bring up kind cluster
         if: matrix.cluster == 'kind'
-        run: kind create cluster --config e2e/kind/cluster.yaml
+        run: |
+          sudo modprobe br_netfilter
+          kind create cluster --config e2e/kind/cluster.yaml
 
       - name: Deploy kube-router-rs to k0s + gate on Ready
         if: matrix.cluster == 'k0s'
@@ -189,14 +191,17 @@ jobs:
           # Per-node netfilter state — confirms bridge-nf-call-iptables/br_netfilter
           # (the same-node un-DNAT prerequisite) and vs.conntrack are actually set.
           if [ "${{ matrix.cluster }}" = "k0s" ]; then
-            for n in k0s-controller-1 k0s-worker-1 k0s-worker-2 k0s-worker-3; do
-              echo "== $n =="
-              docker exec "$n" sh -c '
-                echo -n "bridge-nf-call-iptables="; cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo MISSING
-                echo -n "br_netfilter="; (lsmod 2>/dev/null | grep -q br_netfilter && echo loaded) || echo absent
-                echo -n "vs.conntrack="; cat /proc/sys/net/ipv4/vs/conntrack 2>/dev/null || echo MISSING' 2>&1
-            done > "$RUNNER_TEMP/out/node-netfilter.txt" 2>&1 || true
+            nodes=(k0s-controller-1 k0s-worker-1 k0s-worker-2 k0s-worker-3)
+          else
+            nodes=(kube-router-rs-control-plane kube-router-rs-worker kube-router-rs-worker2 kube-router-rs-worker3)
           fi
+          for n in "${nodes[@]}"; do
+            echo "== $n =="
+            docker exec "$n" sh -c '
+              echo -n "bridge-nf-call-iptables="; cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo MISSING
+              echo -n "br_netfilter="; (lsmod 2>/dev/null | grep -q br_netfilter && echo loaded) || echo absent
+              echo -n "vs.conntrack="; cat /proc/sys/net/ipv4/vs/conntrack 2>/dev/null || echo MISSING' 2>&1
+          done > "$RUNNER_TEMP/out/node-netfilter.txt" 2>&1 || true
 
       - name: Upload results
         if: always()

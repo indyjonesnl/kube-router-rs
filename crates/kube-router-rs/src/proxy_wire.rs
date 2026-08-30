@@ -7,7 +7,7 @@
 
 use std::net::IpAddr;
 
-use k8s_openapi::api::core::v1::Service as K8sService;
+use k8s_openapi::api::core::v1::{Node as K8sNode, Service as K8sService};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kr_proxy::model::{EndpointInfo, Protocol, SchedFlags, Scheduler, ServiceInfo};
 use kr_proxy::ServiceProvider;
@@ -53,14 +53,27 @@ fn endpoints_for(
         let ports = slice.ports.clone().unwrap_or_default();
         let port = ports
             .iter()
-            .find(|p| port_name.is_empty() || p.name.as_deref() == Some(port_name))
-            .or_else(|| ports.first())
+            .find(|p| !port_name.is_empty() && p.name.as_deref() == Some(port_name))
+            .or_else(|| {
+                if ports.len() == 1 || port_name.is_empty() {
+                    ports.first()
+                } else {
+                    None
+                }
+            })
             .and_then(|p| p.port);
         let Some(port) = port.and_then(|p| u16::try_from(p).ok()) else {
             continue;
         };
         for ep in slice.endpoints.clone().unwrap_or_default() {
-            let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
+            let ready = ep
+                .conditions
+                .as_ref()
+                .map(|c| {
+                    c.ready
+                        .unwrap_or_else(|| c.serving.unwrap_or(!c.terminating.unwrap_or(false)))
+                })
+                .unwrap_or(true);
             let is_local = ep.node_name.as_deref() == Some(local_node);
             for addr in &ep.addresses {
                 if let Ok(ip) = addr.parse::<IpAddr>() {
@@ -97,12 +110,22 @@ pub fn map_services(
         if spec.type_.as_deref() == Some("ExternalName") {
             continue;
         }
-        let mut cluster_ips = spec
-            .cluster_ips
-            .clone()
-            .unwrap_or_else(|| spec.cluster_ip.clone().into_iter().collect());
-        cluster_ips.retain(|ip| ip != "None" && !ip.is_empty());
-        let cluster_ips = parse_ips(&cluster_ips);
+        let mut raw_cluster_ips = Vec::new();
+        if let Some(ref ips) = spec.cluster_ips {
+            for ip in ips {
+                if ip != "None" && !ip.is_empty() {
+                    raw_cluster_ips.push(ip.clone());
+                }
+            }
+        }
+        if raw_cluster_ips.is_empty() {
+            if let Some(ref ip) = spec.cluster_ip {
+                if ip != "None" && !ip.is_empty() {
+                    raw_cluster_ips.push(ip.clone());
+                }
+            }
+        }
+        let cluster_ips = parse_ips(&raw_cluster_ips);
         if cluster_ips.is_empty() {
             continue; // headless / no ClusterIP
         }
@@ -193,24 +216,60 @@ pub fn map_services(
     out
 }
 
-/// `ServiceProvider` backed by the Service + EndpointSlice reflector stores.
+/// `ServiceProvider` backed by the Service + EndpointSlice + Node reflector stores.
 pub struct StoreServiceProvider {
     services: Store<K8sService>,
     slices: Store<EndpointSlice>,
+    nodes: Store<K8sNode>,
     local_node: String,
+    cluster_asn: u32,
+    #[allow(dead_code)]
+    bindon_all_ip: bool,
 }
 
 impl StoreServiceProvider {
-    /// Wrap the stores + local node name.
+    /// Wrap the stores + local node name + cluster config.
     pub fn new(
         services: Store<K8sService>,
         slices: Store<EndpointSlice>,
+        nodes: Store<K8sNode>,
         local_node: String,
+        cluster_asn: u32,
+        bindon_all_ip: bool,
     ) -> Self {
         Self {
             services,
             slices,
+            nodes,
             local_node,
+            cluster_asn,
+            bindon_all_ip,
+        }
+    }
+
+    /// Primary IP of the local node from the Node store.
+    pub fn primary_ip(&self) -> Option<IpAddr> {
+        crate::routing_wire::StoreNodeProvider::new(self.nodes.clone(), self.cluster_asn)
+            .local_node(&self.local_node)
+            .map(|n| n.ip)
+    }
+
+    /// Pod CIDRs of the local node from the Node store.
+    pub fn pod_cidrs(&self) -> Vec<String> {
+        crate::routing_wire::StoreNodeRouteProvider::new(self.nodes.clone())
+            .local_pod_cidrs(&self.local_node)
+            .iter()
+            .map(|c| c.to_string())
+            .collect()
+    }
+
+    /// NodePort bind addresses.
+    #[allow(dead_code)]
+    pub fn node_ips(&self) -> Vec<IpAddr> {
+        if self.bindon_all_ip {
+            Vec::new()
+        } else {
+            self.primary_ip().into_iter().collect()
         }
     }
 }
@@ -307,6 +366,57 @@ mod tests {
         assert!(eps
             .iter()
             .any(|e| e.ip.to_string() == "10.244.1.5" && !e.ready));
+    }
+
+    #[test]
+    fn multi_port_slice_matches_by_name() {
+        let mut slice = slice("default", "web", 8080, "10.244.0.5", "node-a", true);
+        slice.ports = Some(vec![
+            EndpointPort {
+                name: Some("http".into()),
+                port: Some(8080),
+                ..Default::default()
+            },
+            EndpointPort {
+                name: Some("https".into()),
+                port: Some(8443),
+                ..Default::default()
+            },
+        ]);
+        let mut svc = clusterip_service("default", "web", "10.96.0.10");
+        svc.spec.as_mut().unwrap().ports = Some(vec![
+            ServicePort {
+                name: Some("http".into()),
+                port: 80,
+                protocol: Some("TCP".into()),
+                ..Default::default()
+            },
+            ServicePort {
+                name: Some("https".into()),
+                port: 443,
+                protocol: Some("TCP".into()),
+                ..Default::default()
+            },
+        ]);
+        let mapped = map_services(&[svc], &[slice], "node-a");
+        assert_eq!(mapped.len(), 2);
+        let http_eps = &mapped.iter().find(|(s, _)| s.port == 80).unwrap().1;
+        let https_eps = &mapped.iter().find(|(s, _)| s.port == 443).unwrap().1;
+        assert_eq!(http_eps[0].port, 8080);
+        assert_eq!(https_eps[0].port, 8443);
+    }
+
+    #[test]
+    fn empty_cluster_ips_falls_back_to_cluster_ip() {
+        let mut svc = clusterip_service("default", "web", "10.96.0.10");
+        svc.spec.as_mut().unwrap().cluster_ips = Some(vec![]);
+        svc.spec.as_mut().unwrap().cluster_ip = Some("10.96.0.10".into());
+        let mapped = map_services(&[svc], &[], "node-a");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(
+            mapped[0].0.cluster_ips,
+            vec!["10.96.0.10".parse::<IpAddr>().unwrap()]
+        );
     }
 
     #[test]
