@@ -49,12 +49,19 @@ fn endpoints_for(
         {
             continue;
         }
-        // Resolve the slice port matching the service port name.
+        // Resolve the slice port matching the service port name. The match is on
+        // the name ALONE, with no fallback to the first port: upstream keys every
+        // endpoint by its slice port name (`generateServiceID(ns, svc, *port.Name)`
+        // in buildEndpointSliceInfo) and a slice port whose name matches no service
+        // port simply contributes nothing. Falling back to `ports.first()` would
+        // hand one port's endpoints to a different port of a multi-port service —
+        // silently routing e.g. https traffic to the http container port. An
+        // unnamed service port (single-port Service) pairs with an unnamed slice
+        // port, which the empty-string comparison covers.
         let ports = slice.ports.clone().unwrap_or_default();
         let port = ports
             .iter()
-            .find(|p| port_name.is_empty() || p.name.as_deref() == Some(port_name))
-            .or_else(|| ports.first())
+            .find(|p| p.name.as_deref().unwrap_or_default() == port_name)
             .and_then(|p| p.port);
         let Some(port) = port.and_then(|p| u16::try_from(p).ok()) else {
             continue;
@@ -355,6 +362,59 @@ mod tests {
         let https_eps = &mapped.iter().find(|(s, _)| s.port == 443).unwrap().1;
         assert_eq!(http_eps[0].port, 8080);
         assert_eq!(https_eps[0].port, 8443);
+    }
+
+    /// A slice that carries only *some* of a multi-port Service's ports must feed
+    /// the ports it names and nothing else. The previous `.or_else(ports.first())`
+    /// fallback handed the http endpoints to the https service port too, so https
+    /// traffic was load-balanced onto the http container port.
+    #[test]
+    fn multi_port_service_ignores_slice_missing_that_port_name() {
+        let slice = slice("default", "web", 8080, "10.244.0.5", "node-a", true); // ports: [http:8080]
+        let mut svc = clusterip_service("default", "web", "10.96.0.10");
+        svc.spec.as_mut().unwrap().ports = Some(vec![
+            ServicePort {
+                name: Some("http".into()),
+                port: 80,
+                protocol: Some("TCP".into()),
+                ..Default::default()
+            },
+            ServicePort {
+                name: Some("https".into()),
+                port: 443,
+                protocol: Some("TCP".into()),
+                ..Default::default()
+            },
+        ]);
+        let mapped = map_services(&[svc], &[slice], "node-a");
+        assert_eq!(mapped.len(), 2);
+        let http_eps = &mapped.iter().find(|(s, _)| s.port == 80).unwrap().1;
+        let https_eps = &mapped.iter().find(|(s, _)| s.port == 443).unwrap().1;
+        assert_eq!(http_eps.len(), 1);
+        assert_eq!(http_eps[0].port, 8080);
+        assert!(
+            https_eps.is_empty(),
+            "https must not inherit the http endpoints: {https_eps:?}"
+        );
+    }
+
+    /// The name match must still pair an unnamed single-port Service with the
+    /// unnamed slice port the EndpointSlice controller writes for it.
+    #[test]
+    fn unnamed_service_port_matches_unnamed_slice_port() {
+        let mut slice = slice("default", "web", 8080, "10.244.0.5", "node-a", true);
+        slice.ports.as_mut().unwrap()[0].name = None;
+        let mut svc = clusterip_service("default", "web", "10.96.0.10");
+        svc.spec.as_mut().unwrap().ports = Some(vec![ServicePort {
+            name: None,
+            port: 80,
+            protocol: Some("TCP".into()),
+            ..Default::default()
+        }]);
+        let mapped = map_services(&[svc], &[slice], "node-a");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].1.len(), 1);
+        assert_eq!(mapped[0].1[0].port, 8080);
     }
 
     #[test]
