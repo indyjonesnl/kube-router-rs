@@ -14,8 +14,21 @@ x-k0s-worker: &k0s-worker
   image: *k0s-image
   networks:
     - k0s-net
+  # Wait for the controller to be HEALTHY, not merely started. The controller's
+  # healthcheck below goes green only once its post_start hook has written the
+  # pre-shared worker token, which is the file named right here in --token-file.
+  # With a plain start-order dependency compose launches all four containers
+  # within ~0.2s, long before the controller has generated its PKI and the token,
+  # so every worker starts into a doomed kubelet bootstrap, exhausts its attempts,
+  # exits, and gets restarted under `restart: on-failure` backoff. A worker only
+  # starts containerd after that bootstrap succeeds, so deploy.sh's wait for
+  # `k0s ctr version` would then expire mid-backoff — the "TIMEOUT: k0s-worker-1
+  # containerd not ready" that has been reding a random subset of the k0s
+  # conformance jobs (they die before a kubeconfig exists, taking every other
+  # diagnostic in the job with them).
   depends_on:
-    - k0s-controller-1
+    k0s-controller-1:
+      condition: service_healthy
   command: [k0s, worker, --token-file, /run/secrets/k0sproject.io/tokens/worker]
   volumes:
     - /var/lib/k0s
@@ -79,6 +92,17 @@ services:
     # kube-router-rs DaemonSet (tolerations: operator Exists) lands here, not
     # general workloads. Mirrors a real kube-router deployment (runs on all nodes).
     command: [k0s, controller, --enable-worker]
+    # Healthy == the worker token exists, which is what the workers block on.
+    # start_period covers PKI generation + the post_start bootstrap loop without
+    # counting failures, so a slow runner just takes longer rather than tripping
+    # the container into `unhealthy`; after it, 30 x 2s before compose gives up
+    # with a clear "dependency failed to start" instead of a silent stall.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/secrets/k0sproject.io/worker-token/worker"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 240s
     post_start:
       - command:
           - /bin/sh

@@ -41,10 +41,27 @@ echo "== import image into each node's containerd =="
 # nodes (incl. the controller, which runs `--enable-worker`) run a worker containerd
 # and need the CNI image, so a failed import is fatal, not skippable — a swallowed
 # failure leaves the node CNI-less and NotReady until the 10-min Ready gate times out.
+#
+# A worker only starts containerd AFTER it has bootstrapped its kubelet client
+# config against the API, so this wait covers the whole controller-PKI → token →
+# join sequence, not just containerd itself. On a slow runner that can take a
+# while, hence the generous budget — and when it does expire, dump the container
+# state and node logs: a bare "TIMEOUT" line left several CI failures
+# undiagnosable because the deploy dies before a kubeconfig exists, so every
+# kubectl-based diagnostic in the workflow's collect step comes back empty too.
 wait_containerd() {
-  local n="$1" deadline=$(( $(date +%s) + 180 ))
+  local n="$1" deadline=$(( $(date +%s) + 300 ))
   until docker exec "$n" k0s ctr -a /run/k0s/containerd.sock version >/dev/null 2>&1; do
-    [ "$(date +%s)" -ge "$deadline" ] && { echo "TIMEOUT: $n containerd not ready" >&2; return 1; }
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "TIMEOUT: $n containerd not ready" >&2
+      echo "--- container state ---" >&2
+      docker ps -a --filter "name=k0s-" --format '{{.Names}}\t{{.Status}}' >&2 || true
+      for d in "${NODES[@]}"; do
+        echo "--- docker logs $d (tail) ---" >&2
+        docker logs --tail=120 "$d" >&2 2>&1 || true
+      done
+      return 1
+    fi
     sleep 3
   done
 }
