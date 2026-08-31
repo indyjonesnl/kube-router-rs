@@ -520,6 +520,29 @@ fn ensure_rp_filter_loose(iface: &str) {
 /// on the proxy-relevant interfaces (`all`, `kube-bridge`, `kube-dummy-if`, and
 /// the node's primary link). Mirrors `network_services_controller` startup.
 async fn setup_ipvs_sysctls(primary_ip: Option<std::net::IpAddr>) {
+    // The `net.ipv4.vs.*` knobs below do not exist until IPVS is initialised in
+    // this netns, and at startup it is not: nothing has programmed a virtual
+    // service yet. Writing them first fails with ENOENT on every key, and since
+    // they are never retried the kernel defaults stand for the life of the node —
+    // the opposite of every value we ask for (conntrack=0, expire_nodest_conn=0,
+    // expire_quiescent_template=0, conn_reuse_mode=1).
+    //
+    // `vs.conntrack=0` is the damaging one. It keeps IPVS-forwarded packets out of
+    // conntrack and the nat table, so the POSTROUTING SNAT rule that masquerades
+    // outbound IPVS traffic to the node IP never fires. A backend then replies
+    // straight to the client pod's IP instead of via the director node, the client
+    // drops the reply as coming from an unexpected source, and the connection hangs
+    // in SYN_RECV. It only shows when client, director and backend are three
+    // DIFFERENT nodes — the same-node and backend-on-director paths return through
+    // the director anyway, which is why ClusterIP looks fine and only remote
+    // NodePort traffic breaks.
+    //
+    // Opening the IPVS generic-netlink family is what pulls the module in
+    // (`MODULE_ALIAS_GENL_FAMILY` on ip_vs), so the sysctls exist by the time we
+    // write them. Best-effort: on a node where IPVS is genuinely unavailable the
+    // writes below fail and warn exactly as before. `modprobe` is not used because
+    // the agent image ships no kmod.
+    drop(kr_proxy::genetlink::Genl::open());
     for (key, val) in [
         ("net.ipv4.vs.conntrack", "1"), // conntrack for masquerade-mode ClusterIP
         ("net.ipv4.vs.expire_nodest_conn", "1"), // drop conns to removed real servers (UDP failover)
@@ -531,6 +554,19 @@ async fn setup_ipvs_sysctls(primary_ip: Option<std::net::IpAddr>) {
         if let Err(e) = kr_common::sysctl::write(key, val) {
             tracing::warn!(error = %e, key, "could not set sysctl");
         }
+    }
+    // Assert the one whose absence silently breaks the datapath. The loop above
+    // only logs a per-key ENOENT, which is easy to lose in startup noise.
+    if kr_common::sysctl::read("net.ipv4.vs.conntrack")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        tracing::warn!(
+            "net.ipv4.vs.conntrack is not 1: IPVS traffic bypasses the POSTROUTING \
+             masquerade rule, so replies to a remote NodePort/ClusterIP take the wrong \
+             return path and the connection stalls"
+        );
     }
     for iface in ["all", "kube-bridge", kr_proxy::sync::DUMMY_IF] {
         ensure_rp_filter_loose(iface);
