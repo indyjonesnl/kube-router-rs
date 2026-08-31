@@ -160,10 +160,30 @@ pub fn build_plan(
             .push(format!("-A {podchain} -j {}", reject_target(family)));
 
         for ip in pod_family_ips(pod, family) {
+            // Three jump points, mirroring upstream's interceptPodInboundTraffic.
+            // Each covers a different way a packet reaches a local pod, and missing
+            // any of them means that path is never evaluated — so the traffic is
+            // ACCEPTed by default rather than hitting the chain's trailing REJECT.
+            //
+            // 1. routed in from another node.
             plan.rules
                 .push(format!("-A {ROUTER_FORWARD} -d {ip} -j {podchain}"));
+            // 2. routed back to a same-node pod by the SERVICE PROXY. After IPVS
+            //    DNATs a ClusterIP to a backend on this node, the packet is emitted
+            //    from LOCAL_OUT, so it traverses OUTPUT and never FORWARD. This
+            //    jump was previously written against ROUTER_INPUT, where a
+            //    `-d <podIP>` match effectively never fires (traffic addressed to a
+            //    pod IP is forwarded, not delivered locally) — so every same-node
+            //    pod->ClusterIP->pod flow bypassed the pod firewall. The whole
+            //    NetworkPolicy conformance suite probes through per-pod Services,
+            //    which is why even a plain 'default-deny-ingress' policy failed.
             plan.rules
-                .push(format!("-A {ROUTER_INPUT} -d {ip} -j {podchain}"));
+                .push(format!("-A {ROUTER_OUTPUT} -d {ip} -j {podchain}"));
+            // 3. switched (bridged) from a pod on this same node, which is L2 and
+            //    only visible to iptables via physdev once br_netfilter is loaded.
+            plan.rules.push(format!(
+                "-A {ROUTER_FORWARD} -m physdev --physdev-is-bridged -d {ip} -j {podchain}"
+            ));
             programmed_ips.push(ip);
         }
     }
@@ -184,11 +204,17 @@ pub fn build_plan(
                 (IpNet::V4(_), IpFamily::V4) | (IpNet::V6(_), IpFamily::V6)
             )
         }) {
+            // Same three paths as the per-pod jumps above; a tail reject that only
+            // covers FORWARD leaves the service-proxy and bridged paths wide open.
             plan.rules.push(format!(
                 "-A {ROUTER_FORWARD} -d {cidr} -m set ! --match-set {set} dst -j {reject}"
             ));
             plan.rules.push(format!(
-                "-A {ROUTER_INPUT} -d {cidr} -m set ! --match-set {set} dst -j {reject}"
+                "-A {ROUTER_OUTPUT} -d {cidr} -m set ! --match-set {set} dst -j {reject}"
+            ));
+            plan.rules.push(format!(
+                "-A {ROUTER_FORWARD} -m physdev --physdev-is-bridged -d {cidr} \
+                 -m set ! --match-set {set} dst -j {reject}"
             ));
         }
     }
@@ -296,6 +322,79 @@ mod tests {
             .unwrap();
         assert!(set.entries.contains(&"10.244.0.6".to_string()));
         assert_eq!(set.set_type, SetType::HashNet);
+    }
+
+    /// A packet reaches a local pod by three different paths, and a jump is needed
+    /// for each: routed from another node (FORWARD), emitted from LOCAL_OUT after
+    /// the service proxy DNATs a ClusterIP to a same-node backend (OUTPUT), and
+    /// bridged from a same-node pod (physdev). A missing jump is not a missing
+    /// rule — it silently ACCEPTs that whole path, because the traffic never
+    /// reaches the pod chain's trailing REJECT.
+    #[test]
+    fn pod_chain_is_reachable_from_all_three_inbound_paths() {
+        let pods = vec![
+            pod("default", "web", &[("app", "web")], "10.244.0.5"),
+            pod("default", "client", &[("app", "client")], "10.244.0.6"),
+        ];
+        let plan = build_plan(
+            &[allow_from("web", "client")],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+        );
+        let has = |pat: &str| plan.rules.iter().any(|r| r.contains(pat));
+
+        assert!(
+            has("-A KUBE-ROUTER-FORWARD -d 10.244.0.5 -j KUBE-POD-FW-"),
+            "routed-from-another-node path"
+        );
+        assert!(
+            has("-A KUBE-ROUTER-OUTPUT -d 10.244.0.5 -j KUBE-POD-FW-"),
+            "service-proxy loopback to a same-node pod leaves via LOCAL_OUT; \
+             without this jump every pod->ClusterIP->same-node-pod flow skips the \
+             firewall and is allowed"
+        );
+        assert!(
+            has("-A KUBE-ROUTER-FORWARD -m physdev --physdev-is-bridged -d 10.244.0.5 -j KUBE-POD-FW-"),
+            "bridged same-node pod->pod path"
+        );
+    }
+
+    #[test]
+    fn default_deny_tail_reject_covers_all_three_inbound_paths() {
+        let pods = vec![pod("default", "web", &[("app", "web")], "10.244.0.5")];
+        let plan = build_plan(
+            &[allow_from("web", "client")],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            true,
+            &["10.244.0.0/24".parse().unwrap()],
+        );
+        let tail: Vec<&String> = plan
+            .rules
+            .iter()
+            .filter(|r| r.contains("! --match-set") && r.contains("-j REJECT"))
+            .collect();
+        assert!(
+            tail.iter()
+                .any(|r| r.contains("-A KUBE-ROUTER-FORWARD") && !r.contains("physdev")),
+            "{tail:?}"
+        );
+        assert!(
+            tail.iter().any(|r| r.contains("-A KUBE-ROUTER-OUTPUT")),
+            "{tail:?}"
+        );
+        assert!(
+            tail.iter().any(|r| r.contains("--physdev-is-bridged")),
+            "{tail:?}"
+        );
     }
 
     #[test]
