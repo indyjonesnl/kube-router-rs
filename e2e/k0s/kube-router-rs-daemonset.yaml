@@ -78,6 +78,15 @@ spec:
             - --run-firewall=true
             - --run-service-proxy=true
             - --run-loadbalancer=false
+            # The NetworkPolicy conformance suite probes each pod against its OWN
+            # ClusterIP (one pod, one service, itself the only endpoint) to decide
+            # its HTTP server is ready. That is hairpin traffic, and upstream needs
+            # BOTH halves for it: the CNI conflist's "hairpinMode": true (we already
+            # emit it, crates/cni/src/lib.rs) AND this flag, which is what actually
+            # fills KUBE-ROUTER-HAIRPIN with the SNAT-to-VIP rules. Without it the
+            # chain exists but is empty, every self-probe times out, and the suite
+            # dies in initialisation before applying a single policy.
+            - --hairpin-mode=true
             - --cluster-asn=64512
             # short sync periods for the e2e loop (event-driven sync is a follow-up)
             - --iptables-sync-period=10s
