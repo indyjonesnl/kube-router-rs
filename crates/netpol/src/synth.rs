@@ -20,9 +20,9 @@ use kr_common::naming::{network_policy_chain, pod_firewall_chain};
 use crate::ipset::SetType;
 use crate::model::{selector_matches, Namespace, NetworkPolicy, Pod};
 use crate::naming::{
-    dst_set, indexed_src_ipblock_set, indexed_src_pod_set, local_pods_set, MARK_ACCEPTED,
-    MARK_MATCHED, NWPLCY_COMMON, NWPLCY_DEFAULT, NWPLCY_TAIL, ROUTER_FORWARD, ROUTER_INPUT,
-    ROUTER_OUTPUT,
+    dst_set, indexed_dst_ipblock_set, indexed_dst_pod_set, indexed_src_ipblock_set,
+    indexed_src_pod_set, local_pods_set, src_set, MARK_ACCEPTED, MARK_MATCHED, NWPLCY_COMMON,
+    NWPLCY_DEFAULT, NWPLCY_TAIL, ROUTER_FORWARD, ROUTER_INPUT, ROUTER_OUTPUT,
 };
 use crate::translate::resolve_peers;
 
@@ -75,6 +75,98 @@ fn common_icmp_rules(family: IpFamily) -> Vec<(&'static str, &'static str, &'sta
             ("icmpv6", "--icmpv6-type", "neighbor-advertisement"),
             ("icmpv6", "--icmpv6-type", "echo-reply"),
         ],
+    }
+}
+
+/// Which side of a rule the policy's own pods sit on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Policy pods are the destination; peers are sources (`from`).
+    Ingress,
+    /// Policy pods are the source; peers are destinations (`to`).
+    Egress,
+}
+
+/// Emit one policy's rules for a direction. Ingress and egress are structurally
+/// identical in upstream (`processIngressRules` / `processEgressRules`) with src and
+/// dst swapped, so they share this: the policy's target-pod set is matched on the
+/// side its own pods sit on, and each rule's peers on the other side.
+#[allow(clippy::too_many_arguments)]
+fn emit_policy_rules(
+    plan: &mut FirewallPlan,
+    pchain: &str,
+    rules: &[crate::model::Rule],
+    dir: Direction,
+    target_set: &str,
+    pol: &NetworkPolicy,
+    pods: &[Pod],
+    namespaces: &[Namespace],
+    family: IpFamily,
+) {
+    // The policy's own pods: dst for ingress, src for egress. Peers take the other.
+    let (target_side, peer_side) = match dir {
+        Direction::Ingress => ("dst", "src"),
+        Direction::Egress => ("src", "dst"),
+    };
+    let target_match = format!(" -m set --match-set {target_set} {target_side}");
+
+    for (idx, rule) in rules.iter().enumerate() {
+        let resolved = resolve_peers(&rule.peers, pods, namespaces, &pol.namespace, family);
+
+        // Peers go in TWO sets, as upstream does: pod IPs in a hash:ip set and ipBlock
+        // CIDRs in a hash:net set with `nomatch` exceptions. A single merged hash:net
+        // set cannot express both cleanly.
+        let (pod_set, ipblock_set) = match dir {
+            Direction::Ingress => (
+                indexed_src_pod_set(&pol.namespace, &pol.name, idx, family),
+                indexed_src_ipblock_set(&pol.namespace, &pol.name, idx, family),
+            ),
+            Direction::Egress => (
+                indexed_dst_pod_set(&pol.namespace, &pol.name, idx, family),
+                indexed_dst_ipblock_set(&pol.namespace, &pol.name, idx, family),
+            ),
+        };
+
+        let mut peer_matches: Vec<String> = Vec::new();
+        if resolved.match_all {
+            // No peer selector: match every peer, port matches still apply.
+            peer_matches.push(String::new());
+        } else {
+            if !resolved.ip_entries.is_empty() {
+                plan.ipsets.push(IpsetPlan {
+                    name: pod_set.clone(),
+                    set_type: SetType::HashIp,
+                    family,
+                    entries: resolved.ip_entries.clone(),
+                });
+                peer_matches.push(format!(" -m set --match-set {pod_set} {peer_side}"));
+            }
+            if !resolved.net_entries.is_empty() {
+                plan.ipsets.push(IpsetPlan {
+                    name: ipblock_set.clone(),
+                    set_type: SetType::HashNet,
+                    family,
+                    entries: resolved.net_entries.clone(),
+                });
+                peer_matches.push(format!(" -m set --match-set {ipblock_set} {peer_side}"));
+            }
+        }
+
+        for peer_match in &peer_matches {
+            if rule.ports.is_empty() {
+                push_policy_verdict(plan, pchain, peer_match, &target_match, "");
+            } else {
+                for port in &rule.ports {
+                    // --dport is the peer's port in both directions: for ingress it is
+                    // the policy pod's own port, for egress the destination's.
+                    let pm = match port.port {
+                        Some(p) => format!(" -p {} --dport {p}", port.protocol),
+                        None => format!(" -p {}", port.protocol),
+                    };
+                    push_policy_verdict(plan, pchain, peer_match, &target_match, &pm);
+                }
+            }
+        }
     }
 }
 
@@ -170,69 +262,59 @@ pub fn build_plan(
     // Per-policy chains. Upstream keeps ONE chain per policy for both directions and
     // disambiguates by matching the policy's target-pod ipset on the appropriate side
     // (dst for ingress, src for egress), which is what makes a shared chain safe.
-    for pol in policies.iter().filter(|p| p.policy_types.ingress) {
+    for pol in policies
+        .iter()
+        .filter(|p| p.policy_types.ingress || p.policy_types.egress)
+    {
         let pchain = network_policy_chain(&pol.namespace, &pol.name, sync_version, family);
         plan.chain_decls.push(format!(":{pchain} - [0:0]"));
+        let selected: Vec<String> = pods
+            .iter()
+            .filter(|p| policy_selects(pol, p))
+            .flat_map(|p| pod_family_ips(p, family))
+            .collect();
 
-        // Target-pod set: the policy's own selected pods, matched on dst for ingress.
-        let target_dst = dst_set(&pol.namespace, &pol.name, family);
-        plan.ipsets.push(IpsetPlan {
-            name: target_dst.clone(),
-            set_type: SetType::HashIp,
-            family,
-            entries: pods
-                .iter()
-                .filter(|p| policy_selects(pol, p))
-                .flat_map(|p| pod_family_ips(p, family))
-                .collect(),
-        });
-
-        for (idx, rule) in pol.ingress.iter().enumerate() {
-            let resolved = resolve_peers(&rule.peers, pods, namespaces, &pol.namespace, family);
-
-            // Peers go in TWO sets, as upstream does: pod IPs in a hash:ip set and
-            // ipBlock CIDRs in a hash:net set with `nomatch` exceptions. A single
-            // merged hash:net set cannot express both cleanly.
-            let mut src_matches: Vec<String> = Vec::new();
-            if resolved.match_all {
-                src_matches.push(String::new());
-            } else {
-                if !resolved.ip_entries.is_empty() {
-                    let set = indexed_src_pod_set(&pol.namespace, &pol.name, idx, family);
-                    plan.ipsets.push(IpsetPlan {
-                        name: set.clone(),
-                        set_type: SetType::HashIp,
-                        family,
-                        entries: resolved.ip_entries.clone(),
-                    });
-                    src_matches.push(format!(" -m set --match-set {set} src"));
-                }
-                if !resolved.net_entries.is_empty() {
-                    let set = indexed_src_ipblock_set(&pol.namespace, &pol.name, idx, family);
-                    plan.ipsets.push(IpsetPlan {
-                        name: set.clone(),
-                        set_type: SetType::HashNet,
-                        family,
-                        entries: resolved.net_entries.clone(),
-                    });
-                    src_matches.push(format!(" -m set --match-set {set} src"));
-                }
-            }
-
-            let target_match = format!(" -m set --match-set {target_dst} dst");
-            for src_match in &src_matches {
-                if rule.ports.is_empty() {
-                    push_policy_verdict(&mut plan, &pchain, src_match, &target_match, "");
-                } else {
-                    for port in &rule.ports {
-                        let pm = match port.port {
-                            Some(p) => format!(" -p {} --dport {p}", port.protocol),
-                            None => format!(" -p {}", port.protocol),
-                        };
-                        push_policy_verdict(&mut plan, &pchain, src_match, &target_match, &pm);
-                    }
-                }
-            }
+        if pol.policy_types.ingress {
+            // Ingress: the policy's own pods are the DESTINATION, peers the source.
+            let target = dst_set(&pol.namespace, &pol.name, family);
+            plan.ipsets.push(IpsetPlan {
+                name: target.clone(),
+                set_type: SetType::HashIp,
+                family,
+                entries: selected.clone(),
+            });
+            emit_policy_rules(
+                &mut plan,
+                &pchain,
+                &pol.ingress,
+                Direction::Ingress,
+                &target,
+                pol,
+                pods,
+                namespaces,
+                family,
+            );
+        }
+        if pol.policy_types.egress {
+            // Egress: the policy's own pods are the SOURCE, peers the destination.
+            let target = src_set(&pol.namespace, &pol.name, family);
+            plan.ipsets.push(IpsetPlan {
+                name: target.clone(),
+                set_type: SetType::HashIp,
+                family,
+                entries: selected.clone(),
+            });
+            emit_policy_rules(
+                &mut plan,
+                &pchain,
+                &pol.egress,
+                Direction::Egress,
+                &target,
+                pol,
+                pods,
+                namespaces,
+                family,
+            );
         }
     }
 
@@ -242,14 +324,18 @@ pub fn build_plan(
         .iter()
         .filter(|p| p.node_name == node && !p.host_network && !pod_family_ips(p, family).is_empty())
     {
-        let ingress_policies: Vec<String> = policies
+        // A policy contributes to this pod's chain in whichever direction(s) it
+        // declares. A pod selected by no policy at all keeps default-allow and gets
+        // no chain, exactly as before.
+        let selecting: Vec<&NetworkPolicy> = policies
             .iter()
-            .filter(|p| p.policy_types.ingress && policy_selects(p, pod))
-            .map(|p| network_policy_chain(&p.namespace, &p.name, sync_version, family))
+            .filter(|p| (p.policy_types.ingress || p.policy_types.egress) && policy_selects(p, pod))
             .collect();
-        if ingress_policies.is_empty() {
+        if selecting.is_empty() {
             continue; // default-allow: no per-pod chain at all
         }
+        let has_ingress = selecting.iter().any(|p| p.policy_types.ingress);
+        let has_egress = selecting.iter().any(|p| p.policy_types.egress);
 
         let podchain = pod_firewall_chain(&pod.namespace, &pod.name, sync_version);
         plan.chain_decls.push(format!(":{podchain} - [0:0]"));
@@ -268,16 +354,30 @@ pub fn build_plan(
         }
 
         for ip in pod_family_ips(pod, family) {
-            // Direction-gated jumps, mirroring upstream setupPodNetpolRules. An
-            // ingress-only policy is entered only for traffic TO the pod.
-            for pc in &ingress_policies {
-                plan.rules.push(format!("-A {podchain} -d {ip} -j {pc}"));
+            // Direction-gated jumps, mirroring upstream setupPodNetpolRules. A policy
+            // covering BOTH directions is entered unconditionally — its rules are
+            // already disambiguated by the target-pod ipset on src vs dst. A
+            // single-direction policy is entered only for traffic on that side.
+            for pol in &selecting {
+                let pc = network_policy_chain(&pol.namespace, &pol.name, sync_version, family);
+                match (pol.policy_types.ingress, pol.policy_types.egress) {
+                    (true, true) => plan.rules.push(format!("-A {podchain} -j {pc}")),
+                    (true, false) => plan.rules.push(format!("-A {podchain} -d {ip} -j {pc}")),
+                    (false, true) => plan.rules.push(format!("-A {podchain} -s {ip} -j {pc}")),
+                    (false, false) => unreachable!("filtered above"),
+                }
             }
-            // Egress is not translated yet, so every pod's egress is unrestricted —
-            // which under the mark scheme has to be stated explicitly: without a jump
-            // to DEFAULT the traffic stays unmarked and the REJECT below would fire.
-            plan.rules
-                .push(format!("-A {podchain} -s {ip} -j {NWPLCY_DEFAULT}"));
+            // A direction no policy covers stays unrestricted, which under the mark
+            // scheme must be stated explicitly: without a jump to DEFAULT the traffic
+            // stays unmarked and the REJECT below would fire.
+            if !has_ingress {
+                plan.rules
+                    .push(format!("-A {podchain} -d {ip} -j {NWPLCY_DEFAULT}"));
+            }
+            if !has_egress {
+                plan.rules
+                    .push(format!("-A {podchain} -s {ip} -j {NWPLCY_DEFAULT}"));
+            }
         }
 
         // Unmarked traffic reached no permitting policy: log, reject, then clear the
@@ -304,6 +404,15 @@ pub fn build_plan(
                 .push(format!("-A {ROUTER_OUTPUT} -d {ip} -j {podchain}"));
             plan.rules.push(format!(
                 "-A {ROUTER_FORWARD} -m physdev --physdev-is-bridged -d {ip} -j {podchain}"
+            ));
+            // Outbound: upstream's interceptPodOutboundTraffic jumps on SOURCE from
+            // all three top-level chains plus the bridged variant, so egress is
+            // evaluated wherever the packet leaves from.
+            for chain in [ROUTER_INPUT, ROUTER_FORWARD, ROUTER_OUTPUT] {
+                plan.rules.push(format!("-A {chain} -s {ip} -j {podchain}"));
+            }
+            plan.rules.push(format!(
+                "-A {ROUTER_FORWARD} -m physdev --physdev-is-bridged -s {ip} -j {podchain}"
             ));
             programmed_ips.push(ip);
         }
@@ -399,6 +508,130 @@ mod tests {
             }],
             egress: vec![],
         }
+    }
+
+    fn allow_to(app: &str, to: &str, egress_only: bool) -> NetworkPolicy {
+        NetworkPolicy {
+            namespace: "default".into(),
+            name: "e".into(),
+            pod_selector: lbl(&[("app", app)]),
+            policy_types: PolicyTypes {
+                ingress: !egress_only,
+                egress: true,
+            },
+            ingress: if egress_only {
+                vec![]
+            } else {
+                vec![Rule {
+                    peers: vec![],
+                    ports: vec![],
+                }]
+            },
+            egress: vec![Rule {
+                peers: vec![Peer::Selector {
+                    namespace_selector: None,
+                    pod_selector: Some(lbl(&[("app", to)])),
+                }],
+                ports: vec![],
+            }],
+        }
+    }
+
+    /// Egress is the mirror of ingress: the policy's own pods are matched on SRC and
+    /// the peers on DST, and the pod chain is entered on source address.
+    #[test]
+    fn egress_policy_matches_peers_on_dst_and_is_entered_on_source() {
+        let pods = vec![
+            pod("default", "web", &[("app", "web")], "10.244.0.5"),
+            pod("default", "db", &[("app", "db")], "10.244.0.7"),
+        ];
+        let plan = build_plan(
+            &[allow_to("web", "db", true)],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+        );
+        let has = |pat: &str| plan.rules.iter().any(|r| r.contains(pat));
+
+        // policy pods on src, peers on dst — the opposite sides from ingress.
+        assert!(
+            plan.rules
+                .iter()
+                .any(|r| r.contains("-m set --match-set KUBE-DST-")
+                    && r.contains("dst")
+                    && r.contains("-m set --match-set KUBE-SRC-")
+                    && r.contains("src")),
+            "{:?}",
+            plan.rules
+        );
+        // the pod chain is entered on SOURCE for an egress-only policy.
+        assert!(has("-A KUBE-POD-FW-") && has("-s 10.244.0.5 -j KUBE-NWPLCY-"));
+        // ingress is uncovered, so it must be explicitly marked allowed.
+        assert!(has("-d 10.244.0.5 -j KUBE-NWPLCY-DEFAULT"));
+        // outbound intercepts on all three top-level chains plus the bridged variant.
+        for c in [
+            "KUBE-ROUTER-INPUT",
+            "KUBE-ROUTER-FORWARD",
+            "KUBE-ROUTER-OUTPUT",
+        ] {
+            assert!(
+                has(&format!("-A {c} -s 10.244.0.5 -j KUBE-POD-FW-")),
+                "outbound intercept missing on {c}"
+            );
+        }
+        assert!(has(
+            "-A KUBE-ROUTER-FORWARD -m physdev --physdev-is-bridged -s 10.244.0.5 -j KUBE-POD-FW-"
+        ));
+        // peer pod IPs land in the egress hash:ip set.
+        let set = plan
+            .ipsets
+            .iter()
+            .find(|s| {
+                s.name.starts_with("KUBE-DST-") && s.entries.contains(&"10.244.0.7".to_string())
+            })
+            .expect("egress peer set");
+        assert_eq!(set.set_type, SetType::HashIp);
+    }
+
+    /// A policy declaring both directions is entered WITHOUT an address gate — its
+    /// rules are already separated by which side the target set is matched on. Gating
+    /// it on -d or -s would silently drop one direction.
+    #[test]
+    fn policy_covering_both_directions_is_entered_ungated() {
+        let pods = vec![
+            pod("default", "web", &[("app", "web")], "10.244.0.5"),
+            pod("default", "db", &[("app", "db")], "10.244.0.7"),
+        ];
+        let plan = build_plan(
+            &[allow_to("web", "db", false)],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+        );
+        let jumps: Vec<&String> = plan
+            .rules
+            .iter()
+            .filter(|r| r.contains("KUBE-POD-FW-") && r.contains("-j KUBE-NWPLCY-"))
+            .collect();
+        assert!(
+            jumps
+                .iter()
+                .any(|r| !r.contains("-d ") && !r.contains("-s ")),
+            "both-direction policy must be entered ungated: {jumps:?}"
+        );
+        // and neither direction falls through to DEFAULT.
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|r| r.contains("KUBE-POD-FW-") && r.contains("-j KUBE-NWPLCY-DEFAULT")));
     }
 
     #[test]
