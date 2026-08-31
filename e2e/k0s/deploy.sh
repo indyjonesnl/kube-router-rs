@@ -97,8 +97,17 @@ kubectl apply -f "$HERE/kube-router-rs-daemonset.yaml"
 #     / in-addr.arpa; only the leaked external suffix is caught.)
 core="$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)"
 if [ -n "$core" ]; then
+  # Brace-aware removal: k0s ships `forward . /etc/resolv.conf` as a single line,
+  # but other distros (kubeadm/kind) write it as a BLOCK with `max_concurrent` in
+  # braces. Deleting just the header line there orphans the body and CoreDNS then
+  # refuses the whole Corefile. Drop the header AND any brace body it opens.
   newcore="$(printf '%s' "$core" \
-    | sed '\#forward \. /etc/resolv.conf#d' \
+    | awk '
+        skip { depth += gsub(/{/, "{"); depth -= gsub(/}/, "}"); if (depth <= 0) skip = 0; next }
+        /^[[:space:]]*forward[[:space:]]+\.[[:space:]]+\/etc\/resolv\.conf/ {
+          depth = gsub(/{/, "{") - gsub(/}/, "}"); if (depth > 0) skip = 1; next
+        }
+        { print }' \
     | sed 's/cache 30/cache 1/' \
     | python3 -c '
 import sys
@@ -128,6 +137,15 @@ while :; do
   [ "$(date +%s)" -ge "$deadline" ] && { echo "TIMEOUT: nodes not Ready"; kubectl get nodes; kubectl -n kube-system get pods -o wide; exit 1; }
   sleep 5
 done
-kubectl -n kube-system rollout status deploy/coredns --timeout=300s
+# Surface *why* CoreDNS never became Available. A bad Corefile edit above shows
+# up here as a 5-minute silent timeout otherwise; the pod log names the directive.
+if ! kubectl -n kube-system rollout status deploy/coredns --timeout=300s; then
+  echo "TIMEOUT: CoreDNS not Available"
+  kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+  kubectl -n kube-system logs -l k8s-app=kube-dns --tail=50 --all-containers --prefix || true
+  echo "--- Corefile ---"
+  kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}'; echo
+  exit 1
+fi
 kubectl get nodes
 echo "DEPLOY OK"

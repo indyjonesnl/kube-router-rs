@@ -47,27 +47,33 @@ fi
 sed "s#__KIND_API_HOST__#${api_host}#g" "$HERE/kube-router-rs-daemonset.yaml" | kubectl apply -f -
 
 echo "== tune CoreDNS =="
+# ONLY the cache TTL is tuned here, and deliberately so.
+#
+# Why cache: the stock `cache 30` lets a replica serve a stale A record for up to
+# 30s after a Service flips ClusterIP -> ExternalName, timing out the "change type
+# to ExternalName" DNS conformance test. 1s propagates in time. `cache 30` is a
+# BLOCK on kind (`cache 30 { disable success cluster.local ... }`), so rewriting
+# only the token leaves the block and its braces intact — this edit is safe.
+#
+# Why nothing else: do NOT copy e2e/k0s/deploy.sh's extra tuning (dropping
+# `forward . /etc/resolv.conf`, NXDOMAIN template for the runner's Azure search
+# domain) into this script. kind needs neither, and the forward removal breaks it:
+#   * kind's kubeadm-generated Corefile writes forward as a BLOCK
+#     (`forward . /etc/resolv.conf {` / `max_concurrent 1000` / `}`), unlike k0s's
+#     single-line form. A line-wise delete strips only the header and leaves the
+#     orphaned `max_concurrent 1000` plus its closing brace, so CoreDNS rejects the
+#     Corefile ("Unknown directive 'max_concurrent'"), CrashLoopBackOffs, and every
+#     kind conformance job dies at the rollout gate below without running a spec.
+#   * kind's CoreDNS forwards to Docker's embedded resolver, which IS reachable
+#     from the node netns (unlike k0s's node-loopback systemd-resolved), and kind
+#     nodes inherit no Azure search domain. Neither edit buys anything here.
 core="$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' 2>/dev/null || true)"
 if [ -n "$core" ]; then
-  newcore="$(printf '%s' "$core" \
-    | sed '\#forward \. /etc/resolv.conf#d' \
-    | sed 's/cache 30/cache 1/' \
-    | python3 -c '
-import sys
-tmpl = ("    template ANY ANY internal.cloudapp.net {\n"
-        "      rcode NXDOMAIN\n"
-        "    }\n")
-out = []
-for ln in sys.stdin:
-    out.append(ln)
-    if ln.strip() == "errors":  # insert inside the .:53 server block
-        out.append(tmpl)
-sys.stdout.write("".join(out))
-')"
+  newcore="$(printf '%s' "$core" | sed 's/cache 30/cache 1/')"
   kubectl -n kube-system patch cm coredns --type merge \
     -p "$(python3 -c 'import json,sys;print(json.dumps({"data":{"Corefile":sys.stdin.read()}}))' <<<"$newcore")" >/dev/null 2>&1 \
     && kubectl -n kube-system rollout restart deploy/coredns >/dev/null 2>&1 \
-    && echo "tuned CoreDNS (dropped external forward, NXDOMAIN azure search domain, cache -> 1s)"
+    && echo "tuned CoreDNS cache -> 1s"
 fi
 
 echo "== gate: wait for nodes Ready + CoreDNS Available =="
@@ -84,6 +90,15 @@ while :; do
   fi
   sleep 5
 done
-kubectl -n kube-system rollout status deploy/coredns --timeout=300s
+# Surface *why* CoreDNS never became Available. A bad Corefile edit above shows
+# up here as a 5-minute silent timeout otherwise; the pod log names the directive.
+if ! kubectl -n kube-system rollout status deploy/coredns --timeout=300s; then
+  echo "TIMEOUT: CoreDNS not Available"
+  kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+  kubectl -n kube-system logs -l k8s-app=kube-dns --tail=50 --all-containers --prefix || true
+  echo "--- Corefile ---"
+  kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}'; echo
+  exit 1
+fi
 kubectl get nodes
 echo "DEPLOY OK"
