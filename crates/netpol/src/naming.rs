@@ -11,6 +11,16 @@ pub const ROUTER_FORWARD: &str = "KUBE-ROUTER-FORWARD";
 /// Top-level OUTPUT chain.
 pub const ROUTER_OUTPUT: &str = "KUBE-ROUTER-OUTPUT";
 
+/// Chain holding rules applicable to all bi-directional traffic: INVALID drop,
+/// RELATED,ESTABLISHED accept, ICMP. Mirrors upstream `kubeCommonNetpolChain`.
+pub const NWPLCY_COMMON: &str = "KUBE-NWPLCY-COMMON";
+/// Chain that marks traffic not selected by any policy. Mirrors upstream
+/// `kubeDefaultNetpolChain`.
+pub const NWPLCY_DEFAULT: &str = "KUBE-NWPLCY-DEFAULT";
+/// Chain each `KUBE-ROUTER-{INPUT,FORWARD,OUTPUT}` ends with, holding the
+/// ACCEPT/REJECT decision. Mirrors upstream `kubeTailNetpolChain`.
+pub const NWPLCY_TAIL: &str = "KUBE-NWPLCY-TAIL";
+
 /// Mark set when a packet matches any policy rule.
 pub const MARK_MATCHED: &str = "0x10000/0x10000";
 /// Mark set when a packet is accepted by a policy.
@@ -57,6 +67,63 @@ pub fn indexed_dst_set(namespace: &str, policy: &str, rule: usize, family: IpFam
     format!(
         "{DST_PREFIX}{}",
         hash16(&format!("{namespace}{policy}egress{rule}{}", fam(family)))
+    )
+}
+
+/// Per-rule-indexed source ipset holding peer POD IPs only (`hash:ip`). Upstream
+/// keeps pod peers and ipBlock peers in separate sets — `policyIndexedSourcePodIPSetName`
+/// vs `policyIndexedSourceIPBlockIPSetName` — because the first is `hash:ip` and the
+/// second `hash:net` with `nomatch` exceptions.
+pub fn indexed_src_pod_set(namespace: &str, policy: &str, rule: usize, family: IpFamily) -> String {
+    format!(
+        "{SRC_PREFIX}{}",
+        hash16(&format!(
+            "{namespace}{policy}ingressrule{rule}{}pod",
+            fam(family)
+        ))
+    )
+}
+
+/// Per-rule-indexed source ipset holding ipBlock CIDRs (`hash:net`).
+pub fn indexed_src_ipblock_set(
+    namespace: &str,
+    policy: &str,
+    rule: usize,
+    family: IpFamily,
+) -> String {
+    format!(
+        "{SRC_PREFIX}{}",
+        hash16(&format!(
+            "{namespace}{policy}ingressrule{rule}{}ipblock",
+            fam(family)
+        ))
+    )
+}
+
+/// Per-rule-indexed destination ipset holding peer POD IPs only (`hash:ip`).
+pub fn indexed_dst_pod_set(namespace: &str, policy: &str, rule: usize, family: IpFamily) -> String {
+    format!(
+        "{DST_PREFIX}{}",
+        hash16(&format!(
+            "{namespace}{policy}egressrule{rule}{}pod",
+            fam(family)
+        ))
+    )
+}
+
+/// Per-rule-indexed destination ipset holding ipBlock CIDRs (`hash:net`).
+pub fn indexed_dst_ipblock_set(
+    namespace: &str,
+    policy: &str,
+    rule: usize,
+    family: IpFamily,
+) -> String {
+    format!(
+        "{DST_PREFIX}{}",
+        hash16(&format!(
+            "{namespace}{policy}egressrule{rule}{}ipblock",
+            fam(family)
+        ))
     )
 }
 
