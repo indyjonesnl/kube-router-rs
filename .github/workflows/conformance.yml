@@ -188,6 +188,29 @@ jobs:
           kubectl -n kube-system logs ds/kube-router-rs --all-containers --tail=400 > "$RUNNER_TEMP/out/kube-router-rs.log" 2>&1 || true
           kubectl -n kube-system logs ds/kube-router-rs --all-containers --previous --tail=400 > "$RUNNER_TEMP/out/kube-router-rs-previous.log" 2>&1 || true
           kubectl -n kube-system logs deploy/coredns --tail=200 > "$RUNNER_TEMP/out/coredns.log" 2>&1 || true
+          # Docker-level state for k0s. The bringup step can fail at `compose up -d`
+          # itself ("dependency failed to start: container k0s-controller-1 is
+          # unhealthy"), which is BEFORE deploy.sh runs — so none of its diagnostics
+          # fire, and every kubectl command above returns nothing because no
+          # kubeconfig was ever written. The containers are still present at this
+          # point (teardown is a later step), so capture them here or the failure is
+          # unexplainable. The controller's health log is the key artifact: it holds
+          # the output of the healthcheck that gated the workers.
+          if [ "${{ matrix.cluster }}" = "k0s" ]; then
+            {
+              echo "== docker ps -a =="
+              docker ps -a --filter "name=k0s-" --format '{{.Names}}\t{{.Status}}' || true
+              echo
+              echo "== k0s-controller-1 health log =="
+              docker inspect --format '{{json .State.Health}}' k0s-controller-1 2>&1 \
+                | python3 -m json.tool 2>/dev/null || echo "(no health state)"
+              for n in k0s-controller-1 k0s-worker-1 k0s-worker-2 k0s-worker-3; do
+                echo
+                echo "== docker logs $n (tail 200) =="
+                docker logs --tail=200 "$n" 2>&1 || true
+              done
+            } > "$RUNNER_TEMP/out/k0s-bringup.txt" 2>&1 || true
+          fi
           # Per-node netfilter state — confirms bridge-nf-call-iptables/br_netfilter
           # (the same-node un-DNAT prerequisite) and vs.conntrack are actually set.
           if [ "${{ matrix.cluster }}" = "k0s" ]; then
