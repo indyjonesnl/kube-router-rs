@@ -5,16 +5,40 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{Namespace as K8sNamespace, Pod as K8sPod};
 use k8s_openapi::api::networking::v1::{NetworkPolicy as K8sNetworkPolicy, NetworkPolicyPeer};
-use kr_netpol::model::LabelSelector;
+use kr_netpol::model::{LabelSelector, SelectorOp, SelectorRequirement};
 use kr_netpol::{
     Namespace, NetworkPolicy, Peer, Pod, PolicySource, PolicyTypes, PolicyWorld, PortSpec, Rule,
 };
 use kube::runtime::reflector::store::Store;
 
+/// Project a Kubernetes LabelSelector, keeping BOTH halves. Dropping
+/// `matchExpressions` used to leave an expression-only selector empty, and an
+/// empty selector matches EVERYTHING — so a policy targeting a few pods captured
+/// the whole namespace (over-blocking) and an expression peer allowed every pod
+/// (under-blocking), depending on which side it sat on.
 fn match_labels(
     sel: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector,
 ) -> LabelSelector {
-    sel.match_labels.clone().unwrap_or_default()
+    LabelSelector {
+        match_labels: sel.match_labels.clone().unwrap_or_default(),
+        match_expressions: sel
+            .match_expressions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|r| SelectorRequirement {
+                key: r.key.clone(),
+                operator: match r.operator.as_str() {
+                    "In" => Some(SelectorOp::In),
+                    "NotIn" => Some(SelectorOp::NotIn),
+                    "Exists" => Some(SelectorOp::Exists),
+                    "DoesNotExist" => Some(SelectorOp::DoesNotExist),
+                    _ => None,
+                },
+                values: r.values.clone().unwrap_or_default(),
+            })
+            .collect(),
+    }
 }
 
 fn map_peer(p: &NetworkPolicyPeer) -> Option<Peer> {
@@ -221,6 +245,60 @@ mod tests {
             ),
             ..Default::default()
         }
+    }
+
+    /// matchExpressions must survive the projection. They were silently dropped,
+    /// and a selector left empty matches EVERYTHING — so an expression-only
+    /// podSelector captured every pod in the namespace instead of the intended few.
+    #[test]
+    fn projects_match_expressions_not_just_match_labels() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement as K8sReq;
+        let sel = K8sSel {
+            match_labels: Some(
+                [("app".to_string(), "web".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            match_expressions: Some(vec![
+                K8sReq {
+                    key: "tier".into(),
+                    operator: "In".into(),
+                    values: Some(vec!["fe".into(), "be".into()]),
+                },
+                K8sReq {
+                    key: "legacy".into(),
+                    operator: "DoesNotExist".into(),
+                    values: None,
+                },
+            ]),
+        };
+        let got = match_labels(&sel);
+        assert_eq!(got.match_labels.get("app").map(String::as_str), Some("web"));
+        assert_eq!(got.match_expressions.len(), 2);
+        assert_eq!(got.match_expressions[0].key, "tier");
+        assert_eq!(got.match_expressions[0].operator, Some(SelectorOp::In));
+        assert_eq!(got.match_expressions[0].values, vec!["fe", "be"]);
+        assert_eq!(
+            got.match_expressions[1].operator,
+            Some(SelectorOp::DoesNotExist)
+        );
+        assert!(got.match_expressions[1].values.is_empty());
+    }
+
+    /// An operator outside the four the API defines projects to None, which
+    /// `selector_matches` treats as matching nothing rather than everything.
+    #[test]
+    fn unknown_operator_projects_to_none() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement as K8sReq;
+        let sel = K8sSel {
+            match_labels: None,
+            match_expressions: Some(vec![K8sReq {
+                key: "app".into(),
+                operator: "Sideways".into(),
+                values: None,
+            }]),
+        };
+        assert_eq!(match_labels(&sel).match_expressions[0].operator, None);
     }
 
     #[test]

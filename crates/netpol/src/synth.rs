@@ -1,17 +1,21 @@
 //! Firewall synthesis: NetworkPolicies + pods/namespaces → ipset contents + an
 //! iptables filter-table document. Mirrors the chain model of
-//! `upstream/pkg/controllers/netpol` (ingress focus for now).
+//! `upstream/pkg/controllers/netpol`, both directions.
 //!
 //! Semantics:
 //! - A pod selected by no policy is unaffected (default-allow): no per-pod chain.
-//! - A pod selected by an ingress policy gets a `KUBE-POD-FW-<pod>` chain that
-//!   accepts established/related, jumps to each applicable `KUBE-NWPLCY-<policy>`
-//!   chain (which `ACCEPT`s matching traffic), then `REJECT`s the rest.
-//! - Peer sources for a rule go in one `hash:net` ipset (pod IPs as /32 + ipBlock
-//!   CIDRs with `nomatch` exceptions).
+//! - A selected pod gets a `KUBE-POD-FW-<pod>` chain that jumps to
+//!   `KUBE-NWPLCY-COMMON` (stateful accept), permits node-local traffic, dispatches
+//!   to each applicable `KUBE-NWPLCY-<policy>` chain, then REJECTs whatever no
+//!   policy marked and finally sets the accept mark.
+//! - Policy chains MARK + RETURN rather than ACCEPT, so both the sending pod's
+//!   egress chain and the receiving pod's ingress chain get to run.
+//! - A direction no policy covers jumps to `KUBE-NWPLCY-DEFAULT`, which marks it
+//!   allowed.
+//! - Each rule's peers go in two ipsets: pod IPs in `hash:ip`, ipBlock CIDRs in
+//!   `hash:net` with `nomatch` exceptions.
 //!
-//! NOTE: egress, named ports, and upstream's exact mark/COMMON/TAIL layout are
-//! follow-ups; this is a correct, verifiable ingress firewall.
+//! NOTE: named ports are the remaining follow-up.
 
 use ipnet::IpNet;
 use kr_common::ipfamily::IpFamily;
@@ -471,7 +475,7 @@ pub fn build_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Peer, PolicyTypes, Rule};
+    use crate::model::{LabelSelector, Peer, PolicyTypes, Rule};
     use std::collections::BTreeMap;
 
     fn lbl(p: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -494,7 +498,7 @@ mod tests {
         NetworkPolicy {
             namespace: "default".into(),
             name: "p".into(),
-            pod_selector: lbl(&[("app", app)]),
+            pod_selector: LabelSelector::from_labels(lbl(&[("app", app)])),
             policy_types: PolicyTypes {
                 ingress: true,
                 egress: false,
@@ -502,7 +506,7 @@ mod tests {
             ingress: vec![Rule {
                 peers: vec![Peer::Selector {
                     namespace_selector: None,
-                    pod_selector: Some(lbl(&[("app", from)])),
+                    pod_selector: Some(LabelSelector::from_labels(lbl(&[("app", from)]))),
                 }],
                 ports: vec![],
             }],
@@ -514,7 +518,7 @@ mod tests {
         NetworkPolicy {
             namespace: "default".into(),
             name: "e".into(),
-            pod_selector: lbl(&[("app", app)]),
+            pod_selector: LabelSelector::from_labels(lbl(&[("app", app)])),
             policy_types: PolicyTypes {
                 ingress: !egress_only,
                 egress: true,
@@ -530,7 +534,7 @@ mod tests {
             egress: vec![Rule {
                 peers: vec![Peer::Selector {
                     namespace_selector: None,
-                    pod_selector: Some(lbl(&[("app", to)])),
+                    pod_selector: Some(LabelSelector::from_labels(lbl(&[("app", to)]))),
                 }],
                 ports: vec![],
             }],

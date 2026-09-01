@@ -139,7 +139,7 @@ mod tests {
     use super::*;
     use crate::ipset::mock::MockIpset;
     use crate::iptables::mock::MockIptables;
-    use crate::model::{Peer, PolicyTypes, Rule};
+    use crate::model::{LabelSelector, Peer, PolicyTypes, Rule};
     use std::collections::BTreeMap;
 
     fn lbl(p: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -161,7 +161,7 @@ mod tests {
             policies: vec![NetworkPolicy {
                 namespace: "default".into(),
                 name: "web".into(),
-                pod_selector: lbl(&[("app", "web")]),
+                pod_selector: LabelSelector::from_labels(lbl(&[("app", "web")])),
                 policy_types: PolicyTypes {
                     ingress: true,
                     egress: false,
@@ -169,7 +169,7 @@ mod tests {
                 ingress: vec![Rule {
                     peers: vec![Peer::Selector {
                         namespace_selector: None,
-                        pod_selector: Some(lbl(&[("app", "client")])),
+                        pod_selector: Some(LabelSelector::from_labels(lbl(&[("app", "client")]))),
                     }],
                     ports: vec![],
                 }],
