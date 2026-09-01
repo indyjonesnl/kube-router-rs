@@ -15,8 +15,8 @@ x-k0s-worker: &k0s-worker
   networks:
     - k0s-net
   # Wait for the controller to be HEALTHY, not merely started. The controller's
-  # healthcheck below goes green only once its post_start hook has written the
-  # pre-shared worker token, which is the file named right here in --token-file.
+  # healthcheck below goes green only once the pre-shared worker token exists —
+  # the file named right here in --token-file.
   # With a plain start-order dependency compose launches all four containers
   # within ~0.2s, long before the controller has generated its PKI and the token,
   # so every worker starts into a doomed kubelet bootstrap, exhausts its attempts,
@@ -75,6 +75,8 @@ services:
     configs:
       - source: k0s.yaml
         target: /etc/k0s/k0s.yaml
+      - source: k0s-token-bootstrap.sh
+        target: /etc/k0s-token-bootstrap.sh
     restart: on-failure
     # --enable-worker needs the same privileged worker runtime the workers use
     # (rshared mount for kubelet, writable cgroup for the worker pre-flight,
@@ -93,35 +95,25 @@ services:
     # general workloads. Mirrors a real kube-router deployment (runs on all nodes).
     command: [k0s, controller, --enable-worker]
     # Healthy == the worker token exists, which is what the workers block on.
-    # start_period covers PKI generation + the post_start bootstrap loop without
-    # counting failures, so a slow runner just takes longer rather than tripping
-    # the container into `unhealthy`; after it, 30 x 2s before compose gives up
-    # with a clear "dependency failed to start" instead of a silent stall.
+    # start_period covers PKI generation and the bootstrap retries without counting
+    # failures, so a slow runner just takes longer rather than tripping the
+    # container into `unhealthy`; after it, 30 x 2s before compose gives up with a
+    # clear "dependency failed to start" instead of a silent stall.
     healthcheck:
-      test: ["CMD", "test", "-f", "/run/secrets/k0sproject.io/worker-token/worker"]
+      # The check BOOTSTRAPS as well as verifies. This used to be a `post_start`
+      # hook plus a plain `test -f`, but compose runs post_start as a one-shot
+      # `docker exec` and does not retry it, so losing the race with container init
+      #   OCI runtime exec failed: unable to start container process:
+      #   procReady not received
+      # left the token permanently unwritten: the controller stayed unhealthy, the
+      # workers never started, and `up -d` could not repair it because post_start
+      # does not re-run on an existing container. A healthcheck retries every
+      # interval by definition, so a lost exec costs 2s instead of the cluster.
+      test: ["CMD", "sh", "/etc/k0s-token-bootstrap.sh"]
       interval: 2s
       timeout: 5s
       retries: 30
       start_period: 240s
-    post_start:
-      - command:
-          - /bin/sh
-          - -euc
-          - |
-            bootstrap() {
-              find /run/secrets/k0sproject.io/worker-token ! -path /run/secrets/k0sproject.io/worker-token -prune -exec rm -rf {} +
-              k0s token pre-shared --role worker \
-                --cert /var/lib/k0s/pki/ca.crt \
-                --url https://172.31.250.10:6443 \
-                --out /run/secrets/k0sproject.io/worker-token/
-
-              mv /run/secrets/k0sproject.io/worker-token/*.yaml /var/lib/k0s/manifests/k0s-token-secrets/worker.yaml
-              mv /run/secrets/k0sproject.io/worker-token/token_* /run/secrets/k0sproject.io/worker-token/worker
-            }
-
-            while [ ! -f /var/lib/k0s/pki/ca.crt ] || ! bootstrap; do
-              sleep 1
-            done
     volumes:
       - /var/lib/k0s
       - /var/log/pods
@@ -157,6 +149,26 @@ volumes:
       device: tmpfs
 
 configs:
+  # Idempotent: exits 0 as soon as the worker token exists, otherwise tries to
+  # create it and reports unhealthy so the next interval retries. Every step is
+  # allowed to fail; only the token's existence decides the verdict.
+  k0s-token-bootstrap.sh:
+    content: |
+      #!/bin/sh
+      TOKDIR=/run/secrets/k0sproject.io/worker-token
+      TOKEN="$$TOKDIR/worker"
+      [ -f "$$TOKEN" ] && exit 0
+      # The controller has to have generated its PKI before a token can be signed.
+      [ -f /var/lib/k0s/pki/ca.crt ] || exit 1
+      # Clear partial output from an attempt that failed midway.
+      rm -rf "$$TOKDIR"/*.yaml "$$TOKDIR"/token_* 2>/dev/null
+      k0s token pre-shared --role worker \
+        --cert /var/lib/k0s/pki/ca.crt \
+        --url https://172.31.250.10:6443 \
+        --out "$$TOKDIR/" || exit 1
+      mv "$$TOKDIR"/*.yaml /var/lib/k0s/manifests/k0s-token-secrets/worker.yaml || exit 1
+      mv "$$TOKDIR"/token_* "$$TOKEN" || exit 1
+      [ -f "$$TOKEN" ]
   k0s.yaml:
     content: |
       spec:
