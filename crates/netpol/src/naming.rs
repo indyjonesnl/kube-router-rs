@@ -134,6 +134,21 @@ fn fam(family: IpFamily) -> &'static str {
     }
 }
 
+/// Normalise a `--service-node-port-range` (`lo-hi` or `lo:hi`) into the `lo:hi`
+/// form `iptables -m multiport --dports` wants, mirroring upstream
+/// `validateNodePortRange`. Returns None when the range is unusable.
+pub fn validate_node_port_range(range: &str) -> Option<String> {
+    let (lo, hi) = range
+        .split_once(['-', ':'])
+        .map(|(a, b)| (a.trim(), b.trim()))?;
+    let lo: u16 = lo.parse().ok()?;
+    let hi: u16 = hi.parse().ok()?;
+    if lo >= hi {
+        return None;
+    }
+    Some(format!("{lo}:{hi}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

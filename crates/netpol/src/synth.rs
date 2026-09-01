@@ -227,6 +227,8 @@ pub fn build_plan(
     sync_version: &str,
     default_deny: bool,
     pod_cidrs: &[IpNet],
+    service_cluster_ip_ranges: &[IpNet],
+    node_port_range: Option<&str>,
 ) -> FirewallPlan {
     let mut plan = FirewallPlan {
         chain_decls: vec![
@@ -262,6 +264,31 @@ pub fn build_plan(
     plan.rules.push(format!(
         "-A {NWPLCY_DEFAULT} -j MARK --set-xmark {MARK_MATCHED}"
     ));
+
+    // Service traffic must NOT be judged by the pod firewall on its way IN, because
+    // at that point IPVS has not yet DNAT'd the ClusterIP/NodePort to a backend pod:
+    // filter INPUT runs at priority 0 and ip_vs_in later, so `dst` is still the
+    // service VIP and matches no peer set holding pod IPs. Upstream inserts these
+    // RETURNs at the head of KUBE-ROUTER-INPUT (allowTrafficToClusterIPRange plus the
+    // per-protocol NodePort whitelists) so the packet leaves this chain untouched and
+    // is evaluated after DNAT with the real pod address.
+    for range in service_cluster_ip_ranges.iter().filter(|c| {
+        matches!(
+            (c, family),
+            (IpNet::V4(_), IpFamily::V4) | (IpNet::V6(_), IpFamily::V6)
+        )
+    }) {
+        plan.rules
+            .push(format!("-A {ROUTER_INPUT} -d {range} -j RETURN"));
+    }
+    if let Some(ports) = node_port_range {
+        for proto in ["tcp", "udp", "sctp"] {
+            plan.rules.push(format!(
+                "-A {ROUTER_INPUT} -p {proto} -m addrtype --dst-type LOCAL \
+                 -m multiport --dports {ports} -j RETURN"
+            ));
+        }
+    }
 
     // Per-policy chains. Upstream keeps ONE chain per policy for both directions and
     // disambiguates by matching the policy's target-pod ipset on the appropriate side
@@ -558,6 +585,8 @@ mod tests {
             "1",
             false,
             &[],
+            &[],
+            None,
         );
         let has = |pat: &str| plan.rules.iter().any(|r| r.contains(pat));
 
@@ -619,6 +648,8 @@ mod tests {
             "1",
             false,
             &[],
+            &[],
+            None,
         );
         let jumps: Vec<&String> = plan
             .rules
@@ -638,6 +669,84 @@ mod tests {
             .any(|r| r.contains("KUBE-POD-FW-") && r.contains("-j KUBE-NWPLCY-DEFAULT")));
     }
 
+    /// Service traffic must leave KUBE-ROUTER-INPUT before any pod-firewall jump.
+    /// Filter INPUT runs at netfilter priority 0 and ip_vs_in later, so on the way
+    /// in `dst` is still the ClusterIP/NodePort — it matches no peer set holding pod
+    /// IPs, and egress policies would reject traffic the policy actually permits.
+    /// Mirrors upstream allowTrafficToClusterIPRange + the NodePort whitelists.
+    #[test]
+    fn service_vips_and_nodeports_return_before_pod_jumps() {
+        let pods = vec![
+            pod("default", "web", &[("app", "web")], "10.244.0.5"),
+            pod("default", "client", &[("app", "client")], "10.244.0.6"),
+        ];
+        let plan = build_plan(
+            &[allow_from("web", "client")],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+            &["10.96.0.0/12".parse().unwrap()],
+            Some("30000:32767"),
+        );
+        let input: Vec<&String> = plan
+            .rules
+            .iter()
+            .filter(|r| r.starts_with("-A KUBE-ROUTER-INPUT"))
+            .collect();
+
+        let vip_at = input
+            .iter()
+            .position(|r| r.contains("-d 10.96.0.0/12 -j RETURN"))
+            .expect("ClusterIP range RETURN");
+        for proto in ["tcp", "udp", "sctp"] {
+            assert!(
+                input.iter().any(|r| r.contains(&format!("-p {proto}"))
+                    && r.contains("--dst-type LOCAL")
+                    && r.contains("--dports 30000:32767")
+                    && r.contains("-j RETURN")),
+                "missing {proto} nodeport whitelist: {input:?}"
+            );
+        }
+        // ordering is the whole point: a jump placed before these would judge the
+        // packet pre-DNAT.
+        let first_pod_jump = input
+            .iter()
+            .position(|r| r.contains("-j KUBE-POD-FW-"))
+            .expect("a pod jump on INPUT");
+        assert!(
+            vip_at < first_pod_jump,
+            "service VIP RETURN must precede pod jumps: {input:?}"
+        );
+        let last_whitelist = input
+            .iter()
+            .rposition(|r| r.contains("--dports 30000:32767"))
+            .unwrap();
+        assert!(last_whitelist < first_pod_jump, "{input:?}");
+    }
+
+    /// Only ranges of the family being built are emitted.
+    #[test]
+    fn service_vip_return_is_family_scoped() {
+        let pods = vec![pod("default", "web", &[("app", "web")], "10.244.0.5")];
+        let plan = build_plan(
+            &[allow_from("web", "client")],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+            &["fd00::/108".parse().unwrap()],
+            None,
+        );
+        assert!(!plan.rules.iter().any(|r| r.contains("fd00::/108")));
+    }
+
     #[test]
     fn unselected_pod_gets_no_chain_default_allow() {
         let pods = vec![pod("default", "db", &[("app", "db")], "10.244.0.9")];
@@ -650,6 +759,8 @@ mod tests {
             "1",
             false,
             &[],
+            &[],
+            None,
         );
         // db isn't selected → no pod-fw chain, no dispatch.
         assert!(!plan.rules.iter().any(|r| r.contains("10.244.0.9")));
@@ -670,6 +781,8 @@ mod tests {
             "1",
             false,
             &[],
+            &[],
+            None,
         );
 
         let has = |pat: &str| plan.rules.iter().any(|r| r.contains(pat));
@@ -769,6 +882,8 @@ mod tests {
             "1",
             false,
             &[],
+            &[],
+            None,
         );
         let has = |pat: &str| plan.rules.iter().any(|r| r.contains(pat));
 
@@ -803,6 +918,8 @@ mod tests {
             "1",
             true,
             &["10.244.0.0/24".parse().unwrap()],
+            &[],
+            None,
         );
         let has = |pat: &str| plan.rules.iter().any(|r| r.contains(pat));
 
@@ -833,7 +950,18 @@ mod tests {
     fn default_deny_adds_local_pods_set_and_tail_reject() {
         let pods = vec![pod("default", "x", &[("app", "x")], "10.244.0.9")];
         let cidrs = vec!["10.244.0.0/24".parse().unwrap()];
-        let plan = build_plan(&[], &pods, &[], "node-a", IpFamily::V4, "1", true, &cidrs);
+        let plan = build_plan(
+            &[],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            true,
+            &cidrs,
+            &[],
+            None,
+        );
         assert!(plan
             .ipsets
             .iter()
@@ -847,7 +975,18 @@ mod tests {
     fn no_default_deny_means_no_tail_reject() {
         let pods = vec![pod("default", "x", &[("app", "x")], "10.244.0.9")];
         let cidrs = vec!["10.244.0.0/24".parse().unwrap()];
-        let plan = build_plan(&[], &pods, &[], "node-a", IpFamily::V4, "1", false, &cidrs);
+        let plan = build_plan(
+            &[],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &cidrs,
+            &[],
+            None,
+        );
         assert!(!plan
             .rules
             .iter()
@@ -859,7 +998,18 @@ mod tests {
         let mut pol = allow_from("web", "client");
         pol.ingress.clear(); // ingress type, no rules → deny all
         let pods = vec![pod("default", "web", &[("app", "web")], "10.244.0.5")];
-        let plan = build_plan(&[pol], &pods, &[], "node-a", IpFamily::V4, "1", false, &[]);
+        let plan = build_plan(
+            &[pol],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+            &[],
+            None,
+        );
         // pod-fw chain exists with reject, but no ACCEPT-from rules.
         assert!(plan.rules.iter().any(|r| r.contains("-j REJECT")));
         assert!(!plan.rules.iter().any(|r| r.contains("-m set --match-set")));
