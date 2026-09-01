@@ -58,10 +58,13 @@ pub struct FirewallController<I: IpsetOps, T: IptablesOps, S: PolicySource> {
     sync_period: Duration,
     default_deny: bool,
     pod_cidrs: Vec<ipnet::IpNet>,
+    service_cluster_ip_ranges: Vec<ipnet::IpNet>,
+    node_port_range: Option<String>,
 }
 
 impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
     /// Construct.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ipset: I,
         families: Vec<(IpFamily, T)>,
@@ -70,6 +73,8 @@ impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
         sync_period: Duration,
         default_deny: bool,
         pod_cidrs: Vec<ipnet::IpNet>,
+        service_cluster_ip_ranges: Vec<ipnet::IpNet>,
+        node_port_range: Option<String>,
     ) -> Self {
         Self {
             ipset,
@@ -80,6 +85,8 @@ impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
             sync_period,
             default_deny,
             pod_cidrs,
+            service_cluster_ip_ranges,
+            node_port_range,
         }
     }
 
@@ -96,6 +103,8 @@ impl<I: IpsetOps, T: IptablesOps, S: PolicySource> FirewallController<I, T, S> {
                 &self.sync_version,
                 self.default_deny,
                 &self.pod_cidrs,
+                &self.service_cluster_ip_ranges,
+                self.node_port_range.as_deref(),
             );
             for set in &plan.ipsets {
                 let payload =
@@ -139,7 +148,7 @@ mod tests {
     use super::*;
     use crate::ipset::mock::MockIpset;
     use crate::iptables::mock::MockIptables;
-    use crate::model::{Peer, PolicyTypes, Rule};
+    use crate::model::{LabelSelector, Peer, PolicyTypes, Rule};
     use std::collections::BTreeMap;
 
     fn lbl(p: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -161,7 +170,7 @@ mod tests {
             policies: vec![NetworkPolicy {
                 namespace: "default".into(),
                 name: "web".into(),
-                pod_selector: lbl(&[("app", "web")]),
+                pod_selector: LabelSelector::from_labels(lbl(&[("app", "web")])),
                 policy_types: PolicyTypes {
                     ingress: true,
                     egress: false,
@@ -169,7 +178,7 @@ mod tests {
                 ingress: vec![Rule {
                     peers: vec![Peer::Selector {
                         namespace_selector: None,
-                        pod_selector: Some(lbl(&[("app", "client")])),
+                        pod_selector: Some(LabelSelector::from_labels(lbl(&[("app", "client")]))),
                     }],
                     ports: vec![],
                 }],
@@ -204,6 +213,8 @@ mod tests {
             Duration::from_secs(300),
             false,
             Vec::new(),
+            Vec::new(),
+            None,
         );
         ctrl.reconcile().await.unwrap();
 

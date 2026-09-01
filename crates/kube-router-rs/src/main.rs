@@ -486,6 +486,14 @@ async fn run_firewall(
         config.iptables_sync_period,
         config.netpol_default_deny,
         pod_cidrs,
+        // Service VIP ranges and the NodePort range are whitelisted at the head of
+        // KUBE-ROUTER-INPUT so service traffic is not judged before IPVS DNATs it.
+        config
+            .service_cluster_ip_range
+            .iter()
+            .filter_map(|c| c.parse().ok())
+            .collect(),
+        kr_netpol::naming::validate_node_port_range(&config.service_node_port_range),
     );
     let mut rx = shutdown_rx;
     controller

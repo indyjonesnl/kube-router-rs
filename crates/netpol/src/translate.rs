@@ -113,7 +113,7 @@ pub fn resolve_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Pod;
+    use crate::model::{LabelSelector, Pod};
     use std::collections::BTreeMap;
 
     fn lbl(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -143,7 +143,7 @@ mod tests {
     fn selector_resolves_same_namespace_pod_ips() {
         let peers = vec![Peer::Selector {
             namespace_selector: None,
-            pod_selector: Some(lbl(&[("app", "client")])),
+            pod_selector: Some(LabelSelector::from_labels(lbl(&[("app", "client")]))),
         }];
         let pods = vec![
             pod("default", &[("app", "client")], "10.244.0.5"),
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn namespace_selector_widens_to_matched_namespaces() {
         let peers = vec![Peer::Selector {
-            namespace_selector: Some(lbl(&[("team", "a")])),
+            namespace_selector: Some(LabelSelector::from_labels(lbl(&[("team", "a")]))),
             pod_selector: None,
         }];
         let namespaces = vec![
