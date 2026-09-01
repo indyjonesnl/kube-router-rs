@@ -93,6 +93,8 @@ pub struct Pod {
     pub node_name: String,
     /// `hostNetwork` pods are not policy-actionable.
     pub host_network: bool,
+    /// Declared container ports, for resolving named policy ports.
+    pub container_ports: Vec<ContainerPort>,
 }
 
 /// A namespace (projected) — labels used by namespace selectors.
@@ -123,13 +125,38 @@ pub enum Peer {
     },
 }
 
-/// A port match (numeric; named ports are a follow-up).
+/// What a policy port rule refers to. An enum rather than `Option<u16>` because a
+/// NAMED port previously projected to `None`, and `None` means "all ports" — so a
+/// named-port rule silently opened every port instead of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortRef {
+    /// No port given: every port of the protocol.
+    All,
+    /// A literal port number.
+    Number(u16),
+    /// A container-port NAME, resolved against the pods RECEIVING the traffic:
+    /// the policy's own pods for ingress, the peer pods for egress.
+    Name(String),
+}
+
+/// A port match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortSpec {
     /// Lowercase protocol ("tcp"/"udp"/"sctp").
     pub protocol: String,
-    /// Port number; None ⇒ all ports.
-    pub port: Option<u16>,
+    /// Which port(s) this matches.
+    pub port: PortRef,
+}
+
+/// A container port declared by a pod, used to resolve named policy ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerPort {
+    /// Port name, if the container declared one.
+    pub name: Option<String>,
+    /// Lowercase protocol.
+    pub protocol: String,
+    /// Numeric container port.
+    pub port: u16,
 }
 
 /// An ingress/egress rule. Empty `peers` ⇒ match all sources/dests; empty
@@ -305,6 +332,7 @@ mod tests {
             ips: vec![ip.parse().unwrap()],
             node_name: node.to_string(),
             host_network: false,
+            container_ports: Vec::new(),
         }
     }
 

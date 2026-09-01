@@ -192,6 +192,7 @@ mod tests {
                     ips: vec!["10.244.0.5".parse().unwrap()],
                     node_name: "node-a".into(),
                     host_network: false,
+                    container_ports: Vec::new(),
                 },
                 Pod {
                     namespace: "default".into(),
@@ -200,6 +201,7 @@ mod tests {
                     ips: vec!["10.244.0.6".parse().unwrap()],
                     node_name: "node-b".into(),
                     host_network: false,
+                    container_ports: Vec::new(),
                 },
             ],
             namespaces: vec![],

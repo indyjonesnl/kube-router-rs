@@ -130,6 +130,7 @@ mod tests {
             ips: vec![ip.parse().unwrap()],
             node_name: "n".into(),
             host_network: false,
+            container_ports: Vec::new(),
         }
     }
 
@@ -205,6 +206,7 @@ mod tests {
             ips: vec!["10.0.0.1".parse().unwrap(), "fd00::1".parse().unwrap()],
             node_name: "n".into(),
             host_network: false,
+            container_ports: Vec::new(),
         }];
         let v4 = resolve_peers(&peers, &pods, &[], "default", IpFamily::V4);
         let v6 = resolve_peers(&peers, &pods, &[], "default", IpFamily::V6);
