@@ -15,18 +15,23 @@
 //! - Each rule's peers go in two ipsets: pod IPs in `hash:ip`, ipBlock CIDRs in
 //!   `hash:net` with `nomatch` exceptions.
 //!
-//! NOTE: named ports are the remaining follow-up.
+//! - A NAMED port is resolved against the pods RECEIVING the traffic (the
+//!   policy's own pods for ingress, the peers for egress) and matched via a
+//!   per-group ipset on dst, since one name can map to different numbers.
+
+use std::collections::BTreeMap;
 
 use ipnet::IpNet;
 use kr_common::ipfamily::IpFamily;
 use kr_common::naming::{network_policy_chain, pod_firewall_chain};
 
 use crate::ipset::SetType;
-use crate::model::{selector_matches, Namespace, NetworkPolicy, Pod};
+use crate::model::{selector_matches, Namespace, NetworkPolicy, Pod, PortRef};
 use crate::naming::{
-    dst_set, indexed_dst_ipblock_set, indexed_dst_pod_set, indexed_src_ipblock_set,
-    indexed_src_pod_set, local_pods_set, src_set, MARK_ACCEPTED, MARK_MATCHED, NWPLCY_COMMON,
-    NWPLCY_DEFAULT, NWPLCY_TAIL, ROUTER_FORWARD, ROUTER_INPUT, ROUTER_OUTPUT,
+    dst_set, indexed_dst_ipblock_set, indexed_dst_pod_set, indexed_egress_named_port_set,
+    indexed_ingress_named_port_set, indexed_src_ipblock_set, indexed_src_pod_set, local_pods_set,
+    src_set, MARK_ACCEPTED, MARK_MATCHED, NWPLCY_COMMON, NWPLCY_DEFAULT, NWPLCY_TAIL,
+    ROUTER_FORWARD, ROUTER_INPUT, ROUTER_OUTPUT,
 };
 use crate::translate::resolve_peers;
 
@@ -156,18 +161,117 @@ fn emit_policy_rules(
             }
         }
 
+        // A named port names a port on whoever RECEIVES the traffic: the policy's
+        // own pods for ingress, the peer pods for egress. Resolve against those,
+        // grouped by (protocol, number) — the same name can map to different
+        // numbers on different pods, and upstream emits one ipset per group
+        // (policyIndexed{Ingress,Egress}NamedPortIPSetName).
+        let receivers: Vec<&Pod> = match dir {
+            Direction::Ingress => pods.iter().filter(|p| policy_selects(pol, p)).collect(),
+            Direction::Egress if resolved.match_all => {
+                // `to` omitted but a named port given: upstream resolves against
+                // every pod in the policy's namespace so "any destination, this
+                // named port" is still expressible.
+                pods.iter()
+                    .filter(|p| p.namespace == pol.namespace)
+                    .collect()
+            }
+            Direction::Egress => pods
+                .iter()
+                .filter(|p| {
+                    pod_family_ips(p, family)
+                        .iter()
+                        .any(|ip| resolved.ip_entries.contains(ip))
+                })
+                .collect(),
+        };
+
         for peer_match in &peer_matches {
             if rule.ports.is_empty() {
                 push_policy_verdict(plan, pchain, peer_match, &target_match, "");
-            } else {
-                for port in &rule.ports {
-                    // --dport is the peer's port in both directions: for ingress it is
-                    // the policy pod's own port, for egress the destination's.
-                    let pm = match port.port {
-                        Some(p) => format!(" -p {} --dport {p}", port.protocol),
-                        None => format!(" -p {}", port.protocol),
-                    };
-                    push_policy_verdict(plan, pchain, peer_match, &target_match, &pm);
+                continue;
+            }
+            for port in &rule.ports {
+                match &port.port {
+                    PortRef::All => {
+                        push_policy_verdict(
+                            plan,
+                            pchain,
+                            peer_match,
+                            &target_match,
+                            &format!(" -p {}", port.protocol),
+                        );
+                    }
+                    PortRef::Number(n) => {
+                        push_policy_verdict(
+                            plan,
+                            pchain,
+                            peer_match,
+                            &target_match,
+                            &format!(" -p {} --dport {n}", port.protocol),
+                        );
+                    }
+                    PortRef::Name(name) => {
+                        // Group receiver IPs by the number this name resolves to.
+                        let mut groups: BTreeMap<u16, Vec<String>> = BTreeMap::new();
+                        for pod in &receivers {
+                            for cp in &pod.container_ports {
+                                if cp.name.as_deref() == Some(name.as_str())
+                                    && cp.protocol == port.protocol
+                                {
+                                    groups
+                                        .entry(cp.port)
+                                        .or_default()
+                                        .extend(pod_family_ips(pod, family));
+                                }
+                            }
+                        }
+                        // No pod exposes it: emit NOTHING. The rule permits nothing,
+                        // which is the point of the "should not allow all ports if it
+                        // cannot limit to the requested port" spec — falling back to
+                        // an all-ports rule is what used to happen and is wrong.
+                        for (ep, (resolved_port, mut ips)) in groups.into_iter().enumerate() {
+                            ips.sort();
+                            ips.dedup();
+                            let set = match dir {
+                                Direction::Ingress => indexed_ingress_named_port_set(
+                                    &pol.namespace,
+                                    &pol.name,
+                                    idx,
+                                    ep,
+                                    family,
+                                ),
+                                Direction::Egress => indexed_egress_named_port_set(
+                                    &pol.namespace,
+                                    &pol.name,
+                                    idx,
+                                    ep,
+                                    family,
+                                ),
+                            };
+                            plan.ipsets.push(IpsetPlan {
+                                name: set.clone(),
+                                set_type: SetType::HashIp,
+                                family,
+                                entries: ips,
+                            });
+                            // The named-port set always sits on dst — it holds the
+                            // receivers — replacing whichever of target/peer that side
+                            // would otherwise carry.
+                            let named_match = format!(" -m set --match-set {set} dst");
+                            let other = match dir {
+                                Direction::Ingress => peer_match.clone(),
+                                Direction::Egress => target_match.clone(),
+                            };
+                            push_policy_verdict(
+                                plan,
+                                pchain,
+                                &other,
+                                &named_match,
+                                &format!(" -p {} --dport {resolved_port}", port.protocol),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -518,7 +622,36 @@ mod tests {
             ips: vec![ip.parse().unwrap()],
             node_name: "node-a".into(),
             host_network: false,
+            container_ports: Vec::new(),
         }
+    }
+
+    fn pod_with_ports(
+        ns: &str,
+        name: &str,
+        labels: &[(&str, &str)],
+        ip: &str,
+        ports: &[(&str, &str, u16)],
+    ) -> Pod {
+        let mut p = pod(ns, name, labels, ip);
+        p.container_ports = ports
+            .iter()
+            .map(|(n, proto, port)| crate::model::ContainerPort {
+                name: Some((*n).to_string()),
+                protocol: (*proto).to_string(),
+                port: *port,
+            })
+            .collect();
+        p
+    }
+
+    fn allow_from_named(app: &str, from: &str, port_name: &str) -> NetworkPolicy {
+        let mut pol = allow_from(app, from);
+        pol.ingress[0].ports = vec![crate::model::PortSpec {
+            protocol: "tcp".into(),
+            port: PortRef::Name(port_name.into()),
+        }];
+        pol
     }
 
     fn allow_from(app: &str, from: &str) -> NetworkPolicy {
@@ -745,6 +878,136 @@ mod tests {
             None,
         );
         assert!(!plan.rules.iter().any(|r| r.contains("fd00::/108")));
+    }
+
+    /// An ingress named port resolves against the POLICY'S OWN pods (the receivers)
+    /// and is matched via an ipset on dst plus the resolved number.
+    #[test]
+    fn ingress_named_port_resolves_against_target_pods() {
+        let pods = vec![
+            pod_with_ports(
+                "default",
+                "web",
+                &[("app", "web")],
+                "10.244.0.5",
+                &[("serve-80", "tcp", 8080)],
+            ),
+            pod("default", "client", &[("app", "client")], "10.244.0.6"),
+        ];
+        let plan = build_plan(
+            &[allow_from_named("web", "client", "serve-80")],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+            &[],
+            None,
+        );
+        // resolved to the container port, not the name
+        assert!(
+            plan.rules
+                .iter()
+                .any(|r| r.contains("--dport 8080") && r.contains("dst")),
+            "{:?}",
+            plan.rules
+        );
+        // the named-port set holds the receiving pod's IP
+        let set = plan
+            .ipsets
+            .iter()
+            .find(|s| s.entries == vec!["10.244.0.5".to_string()])
+            .expect("named port set with the web pod IP");
+        assert_eq!(set.set_type, SetType::HashIp);
+        // and never degrades to an all-ports rule
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|r| r.contains("-p tcp -j MARK") || r.ends_with("-p tcp")));
+    }
+
+    /// The same name can map to different numbers on different pods, so each
+    /// resolved number gets its own ipset and rule.
+    #[test]
+    fn named_port_groups_by_resolved_number() {
+        let pods = vec![
+            pod_with_ports(
+                "default",
+                "web1",
+                &[("app", "web")],
+                "10.244.0.5",
+                &[("serve", "tcp", 8080)],
+            ),
+            pod_with_ports(
+                "default",
+                "web2",
+                &[("app", "web")],
+                "10.244.0.7",
+                &[("serve", "tcp", 9090)],
+            ),
+            pod("default", "client", &[("app", "client")], "10.244.0.6"),
+        ];
+        let plan = build_plan(
+            &[allow_from_named("web", "client", "serve")],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+            &[],
+            None,
+        );
+        assert!(plan.rules.iter().any(|r| r.contains("--dport 8080")));
+        assert!(plan.rules.iter().any(|r| r.contains("--dport 9090")));
+        assert!(plan
+            .ipsets
+            .iter()
+            .any(|s| s.entries == vec!["10.244.0.5".to_string()]));
+        assert!(plan
+            .ipsets
+            .iter()
+            .any(|s| s.entries == vec!["10.244.0.7".to_string()]));
+    }
+
+    /// When NO pod exposes the name, the rule must permit NOTHING. Projecting a
+    /// named port to "no port" previously meant ALL ports, so a rule limited to one
+    /// named port opened every port — the "should not allow all ports if it cannot
+    /// limit to the requested port" spec.
+    #[test]
+    fn unresolvable_named_port_permits_nothing() {
+        let pods = vec![
+            pod("default", "web", &[("app", "web")], "10.244.0.5"),
+            pod("default", "client", &[("app", "client")], "10.244.0.6"),
+        ];
+        let plan = build_plan(
+            &[allow_from_named("web", "client", "no-such-port")],
+            &pods,
+            &[],
+            "node-a",
+            IpFamily::V4,
+            "1",
+            false,
+            &[],
+            &[],
+            None,
+        );
+        // no MARK rule in the policy chain at all: nothing is permitted
+        assert!(
+            !plan.rules.iter().any(|r| r.starts_with("-A KUBE-NWPLCY-")
+                && r.contains("MARK")
+                && !r.contains("KUBE-NWPLCY-DEFAULT")),
+            "{:?}",
+            plan.rules
+        );
+        // and definitely no bare -p tcp all-ports rule
+        assert!(!plan
+            .rules
+            .iter()
+            .any(|r| r.contains("-p tcp") && !r.contains("--dport")));
     }
 
     #[test]

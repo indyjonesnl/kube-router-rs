@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{Namespace as K8sNamespace, Pod as K8sPod};
 use k8s_openapi::api::networking::v1::{NetworkPolicy as K8sNetworkPolicy, NetworkPolicyPeer};
-use kr_netpol::model::{LabelSelector, SelectorOp, SelectorRequirement};
+use kr_netpol::model::{ContainerPort, LabelSelector, PortRef, SelectorOp, SelectorRequirement};
 use kr_netpol::{
     Namespace, NetworkPolicy, Peer, Pod, PolicySource, PolicyTypes, PolicyWorld, PortSpec, Rule,
 };
@@ -73,12 +73,15 @@ fn map_ports(
                 .clone()
                 .unwrap_or_else(|| "TCP".into())
                 .to_lowercase();
-            // Numeric ports only; named ports are a follow-up.
+            use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+            // A NAMED port must stay named. Collapsing it to None here meant "all
+            // ports", so a rule limited to one named port opened every port instead.
             let port = match &p.port {
-                Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(n)) => {
-                    u16::try_from(*n).ok()
-                }
-                _ => None,
+                None => PortRef::All,
+                Some(IntOrString::Int(n)) => u16::try_from(*n)
+                    .map(PortRef::Number)
+                    .unwrap_or(PortRef::All),
+                Some(IntOrString::String(name)) => PortRef::Name(name.clone()),
             };
             PortSpec { protocol, port }
         })
@@ -166,6 +169,25 @@ pub fn map_pod(pod: &K8sPod) -> Option<Pod> {
         ips,
         node_name: spec.and_then(|s| s.node_name.clone()).unwrap_or_default(),
         host_network: spec.and_then(|s| s.host_network).unwrap_or(false),
+        // Every container's declared ports, so a named policy port can be resolved
+        // to the number this particular pod listens on.
+        container_ports: spec
+            .map(|s| s.containers.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|c| c.ports.as_deref().unwrap_or_default())
+            .filter_map(|p| {
+                Some(ContainerPort {
+                    name: p.name.clone(),
+                    protocol: p
+                        .protocol
+                        .clone()
+                        .unwrap_or_else(|| "TCP".into())
+                        .to_lowercase(),
+                    port: u16::try_from(p.container_port).ok()?,
+                })
+            })
+            .collect(),
     })
 }
 

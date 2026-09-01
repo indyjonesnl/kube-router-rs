@@ -127,6 +127,43 @@ pub fn indexed_dst_ipblock_set(
     )
 }
 
+/// Per-rule, per-endpoint-group ipset holding the IPs of pods that expose a named
+/// INGRESS port, mirroring `policyIndexedIngressNamedPortIPSetName`. One set per
+/// resolved (protocol, port) group because a name can map to different numbers on
+/// different pods.
+pub fn indexed_ingress_named_port_set(
+    namespace: &str,
+    policy: &str,
+    rule: usize,
+    ep: usize,
+    family: IpFamily,
+) -> String {
+    format!(
+        "{DST_PREFIX}{}",
+        hash16(&format!(
+            "{namespace}{policy}ingressrule{rule}{ep}{}namedport",
+            fam(family)
+        ))
+    )
+}
+
+/// Egress equivalent, mirroring `policyIndexedEgressNamedPortIPSetName`.
+pub fn indexed_egress_named_port_set(
+    namespace: &str,
+    policy: &str,
+    rule: usize,
+    ep: usize,
+    family: IpFamily,
+) -> String {
+    format!(
+        "{DST_PREFIX}{}",
+        hash16(&format!(
+            "{namespace}{policy}egressrule{rule}{ep}{}namedport",
+            fam(family)
+        ))
+    )
+}
+
 fn fam(family: IpFamily) -> &'static str {
     match family {
         IpFamily::V4 => "IPv4",
